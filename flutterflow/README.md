@@ -1,60 +1,55 @@
 # ТСД: проверка перемещений (FlutterFlow Custom Code)
 
-Кладовщик открывает непроведённое перемещение «Склад → Магазин», сканирует собранный товар.
+Кладовщик открывает непроведённое перемещение «Склад → Магазин» и сканирует собранный товар.
 Приложение показывает недостачи, лишнее и пересорт, затем записывает фактические количества
 в 1С (OData, по LAN). Проводит документ кладовщик в 1С.
 
 ## Файлы
 
-| Файл | Тип в FlutterFlow |
-|---|---|
-| `custom_widgets/transfer_list_widget.dart` | Custom Widget `TransferListWidget` — список к проверке |
-| `custom_widgets/transfer_check_widget.dart` | Custom Widget `TransferCheckWidget` — экран проверки |
-| `custom_actions/get_transfers_to_check.dart` | Custom Action `getTransfersToCheck` — то же, что список, но JSON для своего ListView (не нужен, если используете `TransferListWidget`) |
+| Файл | Custom Widget | Страница |
+|---|---|---|
+| `custom_widgets/tsd_settings_widget.dart` | `TsdSettingsWidget` | Settings |
+| `custom_widgets/transfer_list_widget.dart` | `TransferListWidget` | TransferList |
+| `custom_widgets/transfer_check_widget.dart` | `TransferCheckWidget` | TransferCheck |
+| `custom_actions/get_transfers_to_check.dart` | (Custom Action, необязательно) | для своего ListView вместо `TransferListWidget` |
 
-Зависимости: `http`, `shared_preferences` (в FlutterFlow: Custom Code → Dependencies, если ещё не добавлены).
+Зависимости (Custom Code → Dependencies): `http`, `shared_preferences`.
 
-## 0. Custom Widget `TransferListWidget`
+Настройки хранятся на ТСД (SharedPreferences), каждый виджет читает их сам, **App State не нужен**.
+Шапка с кнопками есть в каждом виджете, поэтому **AppBar на страницах отключить**.
 
-Параметры: `baseUrl`, `username`, `password`, `warehouseKey` (String), `daysBack` (int, по умолчанию 7),
-`onOpen` — Action **с параметром `transferKey` (String)**: Navigate To «Проверка» с этим ключом.
-Размер: на весь экран.
+## Страницы
 
-Поиск по номеру/магазину, обновление свайпом вниз и кнопкой. Жёлтым подсвечены документы,
-проверку которых начали на этом ТСД. После возврата со страницы проверки список обновляется сам.
+На каждой странице только один виджет на весь экран (width/height = ∞ или в Expanded).
 
-## 1. Custom Action `getTransfersToCheck` (необязательно)
+### 1. Settings
+- Виджет: `TsdSettingsWidget`, параметров нет (`onSaved` необязателен, по умолчанию возврат назад).
+- Поля: адрес 1С (`http://IP/tbase`), пользователь, пароль, кладовщик, за сколько дней.
+- «Проверить связь и загрузить склады» → выбрать склад-отправитель из списка.
 
-Аргументы: `baseUrl` (String), `username` (String), `password` (String), `warehouseKey` (String), `daysBack` (int).
-Return Type: **JSON, List**.
+### 2. TransferList (Initial Page)
+- Виджет: `TransferListWidget`.
+- `onOpen` — Action **с параметром `transferKey` (String)** → Navigate To **TransferCheck**, передать `transferKey`.
+- `onSettings` — Action → Navigate To **Settings**.
+- Остальные параметры оставить пустыми (берутся из настроек).
 
-Элемент списка: `key`, `number`, `date`, `receiver`, `comment`.
-В списке нет перемещений, у которых в комментарии уже стоит «Проверено ТСД».
+Без настроек показывает кнопку «Настройки». Поиск по номеру/магазину, обновление свайпом вниз.
+Жёлтым — проверка начата на этом ТСД. После возврата со страниц список обновляется сам.
 
-`warehouseKey` основного склада: `c1d8b115-3257-11ef-8278-00155d642b01`.
+### 3. TransferCheck
+- Page Parameter: `transferKey` (String).
+- Виджет: `TransferCheckWidget`, `transferKey` = параметр страницы. Остальное не трогать.
+- После отправки и по кнопке ← возвращается на список.
 
-## 2. Custom Widget `TransferCheckWidget`
+## Один раз в проекте
 
-Параметры: `baseUrl`, `username`, `password`, `transferKey`, `checkerName` (все String),
-`onSaved` (Action: после сохранения, например Navigate Back).
-Размер: на весь экран (width/height = ∞ или Expanded).
-
-## 3. Страницы
-
-1. **Настройки**: поля → App State `baseUrl`, `username`, `password`, `warehouseKey`, `checkerName`.
-2. **Список**: только `TransferListWidget`; `onOpen(transferKey)` → Navigate To «Проверка» (параметр страницы `transferKey`).
-3. **Проверка**: только `TransferCheckWidget` с `transferKey`; `onSaved` → Navigate Back (список обновится сам).
-
-Адрес, логин, пароль и склад удобно держать в App State (persisted).
-`baseUrl` = `http://<IP сервера>/tbase` — по IP, не по имени `srv1`.
-
-## 4. Android: HTTP без TLS
-
-1С опубликована по `http://`. Начиная с Android 9 такие запросы блокируются, поэтому в FlutterFlow:
-Custom Code → Configuration Files → `AndroidManifest.xml` → в тег `<application>` добавить
+**Android, HTTP без TLS.** 1С опубликована по `http://`, Android 9+ такое блокирует:
+Custom Code → Configuration Files → `AndroidManifest.xml` → в `<application>` добавить
 `android:usesCleartextTraffic="true"`.
 
-## 5. Нагрузка на 1С (сделать один раз на сервере)
+**Сканер ТСД:** режим «эмуляция клавиатуры», суффикс **Enter**. Без сканера — кнопка ⌨ на экране проверки.
+
+## Нагрузка на 1С (сделать один раз на сервере)
 
 **Пул сеансов.** Без него каждый запрос открывает новый сеанс 1С (0,5–2 с на сервере и лицензия на время запроса).
 В `default.vrd` публикации (каталог публикации на IIS/Apache) внутри `<point …>`:
@@ -82,12 +77,7 @@ Custom Code → Configuration Files → `AndroidManifest.xml` → в тег `<ap
 Кэш товаров, единиц и штрихкодов хранится на ТСД 24 ч, старше 7 дней удаляется.
 Кнопка ⟳ на экране проверки грузит документ из 1С без кэша.
 
-## 6. Сканер
-
-Режим ТСД — **эмуляция клавиатуры, суффикс Enter**. Виджет ловит коды сам, поле ввода не нужно.
-Без сканера: кнопка ⌨ в шапке.
-
-## Логика
+## Логика проверки
 
 - Блок: штрихкод единицы с `Коэффициент > 1` прибавляет весь блок.
 - `rounded = ceil(план / k) × k`. Если `план < факт ≤ rounded` и факт кратен `k`, строка в порядке (🟢 «блок»).
@@ -104,3 +94,5 @@ Custom Code → Configuration Files → `AndroidManifest.xml` → в тег `<ap
 
 Чтение: номенклатура, единицы измерения, штрихкоды, склады, перемещения.
 Изменение: перемещения. Добавление: единицы измерения.
+
+Пароль 1С хранится на ТСД в настройках приложения: заведите для ТСД отдельного пользователя только с этими правами.

@@ -16,33 +16,40 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// not checked yet (no «Проверено ТСД» in the comment). Tap → [onOpen] with
 /// the document Ref_Key; the list reloads when that action finishes (i.e.
 /// after Navigate Back from the check page).
+///
+/// Connection settings come from TsdSettingsWidget (SharedPreferences
+/// `tsd_settings`); non-empty parameters override them.
 class TransferListWidget extends StatefulWidget {
   const TransferListWidget({
     super.key,
     this.width,
     this.height,
-    required this.baseUrl,
-    required this.username,
-    required this.password,
-    required this.warehouseKey,
-    this.daysBack = 7,
+    this.baseUrl,
+    this.username,
+    this.password,
+    this.warehouseKey,
+    this.daysBack,
     this.onOpen,
+    this.onSettings,
   });
 
   final double? width;
   final double? height;
 
-  /// e.g. http://192.168.1.10/tbase
-  final String baseUrl;
-  final String username;
-  final String password;
+  /// Optional overrides of the saved settings, e.g. http://192.168.1.10/tbase
+  final String? baseUrl;
+  final String? username;
+  final String? password;
 
   /// Ref_Key of the sender warehouse (Склад_Key)
-  final String warehouseKey;
-  final int daysBack;
+  final String? warehouseKey;
+  final int? daysBack;
 
   /// Action with one String parameter: transferKey → navigate to the check page
   final Future Function(String transferKey)? onOpen;
+
+  /// Action: navigate to the settings page (gear icon)
+  final Future Function()? onSettings;
 
   @override
   State<TransferListWidget> createState() => _TransferListWidgetState();
@@ -66,6 +73,32 @@ class _TransferListWidgetState extends State<TransferListWidget> {
   String? _error;
   List<_TransferRow> _rows = [];
   String _search = '';
+
+  // resolved settings
+  String _root = '';
+  String _user = '';
+  String _pass = '';
+  String _warehouse = '';
+  String _warehouseName = '';
+  int _days = 7;
+  bool _noSettings = false;
+
+  Future<void> _readSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    Map<String, dynamic> m = {};
+    try {
+      m = jsonDecode(prefs.getString('tsd_settings') ?? '{}') as Map<String, dynamic>;
+    } catch (_) {}
+    String pick(String? param, String key) =>
+        (param != null && param.trim().isNotEmpty) ? param.trim() : (m[key] ?? '').toString();
+    _root = pick(widget.baseUrl, 'baseUrl').replaceAll(RegExp(r'/+$'), '');
+    _user = pick(widget.username, 'username');
+    _pass = widget.password != null && widget.password!.isNotEmpty ? widget.password! : (m['password'] ?? '').toString();
+    _warehouse = pick(widget.warehouseKey, 'warehouseKey');
+    _warehouseName = (m['warehouseName'] ?? '').toString();
+    _days = widget.daysBack ?? (m['daysBack'] is num ? (m['daysBack'] as num).toInt() : 7);
+    _noSettings = _root.isEmpty || _warehouse.isEmpty;
+  }
 
   @override
   void initState() {
@@ -91,17 +124,16 @@ class _TransferListWidgetState extends State<TransferListWidget> {
       _error = null;
     });
     try {
-      if (widget.baseUrl.trim().isEmpty || widget.warehouseKey.trim().isEmpty) {
-        throw 'Заполните в настройках адрес 1С и склад';
-      }
-      final root = widget.baseUrl.trim().replaceAll(RegExp(r'/+$'), '');
-      final since = DateTime.now().subtract(Duration(days: widget.daysBack < 0 ? 0 : widget.daysBack));
+      await _readSettings();
+      if (_noSettings) throw 'Укажите в настройках адрес 1С и склад';
+      final root = _root;
+      final since = DateTime.now().subtract(Duration(days: _days < 0 ? 0 : _days));
       String two(int v) => v.toString().padLeft(2, '0');
       final sinceStr = '${since.year}-${two(since.month)}-${two(since.day)}T00:00:00';
 
       // Minimal request: no lines, no $expand — store names come from the local cache.
       final docs = await _get(root, 'Document_ПеремещениеТоваров', {
-        r'$filter': "Склад_Key eq guid'${widget.warehouseKey.trim()}' and Posted eq false "
+        r'$filter': "Склад_Key eq guid'$_warehouse' and Posted eq false "
             "and DeletionMark eq false and Date ge datetime'$sinceStr'",
         r'$select': 'Ref_Key,Number,Date,Комментарий,СкладПолучатель_Key',
         r'$orderby': 'Date desc',
@@ -137,7 +169,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     http.Response resp;
     try {
       resp = await http.get(uri, headers: {
-        'Authorization': 'Basic ${base64Encode(utf8.encode('${widget.username}:${widget.password}'))}',
+        'Authorization': 'Basic ${base64Encode(utf8.encode('$_user:$_pass'))}',
         'Accept': 'application/json',
       }).timeout(const Duration(seconds: 30));
     } catch (e) {
@@ -173,6 +205,12 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     return names;
   }
 
+  Future<void> _openSettings() async {
+    if (widget.onSettings == null) return;
+    await widget.onSettings!();
+    if (mounted) await _load();
+  }
+
   Future<void> _open(_TransferRow row) async {
     if (widget.onOpen == null) return;
     await widget.onOpen!(row.key);
@@ -202,7 +240,11 @@ class _TransferListWidgetState extends State<TransferListWidget> {
           child: Column(mainAxisSize: MainAxisSize.min, children: [
             Text(_error!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.red)),
             const SizedBox(height: 12),
-            FilledButton(onPressed: _load, child: const Text('Повторить')),
+            if (_noSettings && widget.onSettings != null)
+              FilledButton.icon(
+                  onPressed: _openSettings, icon: const Icon(Icons.settings), label: const Text('Настройки'))
+            else
+              FilledButton(onPressed: _load, child: const Text('Повторить')),
           ]),
         ),
       );
@@ -238,7 +280,24 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     return SizedBox(
       width: widget.width,
       height: widget.height,
-      child: Column(children: [
+      child: SafeArea(
+       child: Column(children: [
+        Container(
+          width: double.infinity,
+          color: Theme.of(context).colorScheme.primaryContainer,
+          padding: const EdgeInsets.only(left: 12),
+          child: Row(children: [
+            Expanded(
+              child: Text(
+                _warehouseName.isEmpty ? 'Перемещения к проверке' : 'Перемещения · $_warehouseName',
+                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (widget.onSettings != null)
+              IconButton(tooltip: 'Настройки', icon: const Icon(Icons.settings), onPressed: _openSettings),
+          ]),
+        ),
         Padding(
           padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
           child: Row(children: [
@@ -257,7 +316,8 @@ class _TransferListWidgetState extends State<TransferListWidget> {
           ]),
         ),
         Expanded(child: list),
-      ]),
+       ]),
+      ),
     );
   }
 }
