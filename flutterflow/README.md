@@ -96,3 +96,10 @@ Custom Code → Configuration Files → `AndroidManifest.xml` → в `<applicati
 Изменение: перемещения. Добавление: единицы измерения.
 
 Пароль 1С хранится на ТСД в настройках приложения: заведите для ТСД отдельного пользователя только с этими правами.
+
+## Иконка приложения
+
+`assets/icon/` (исходник — `icon_src.svg`):
+- `launcher_icon_1024.png` — Settings → App Assets → **Launcher Icon**;
+- `adaptive_foreground_1024.png` — Android **Adaptive Icon → Foreground** (прозрачный фон, рисунок в безопасной зоне);
+- Adaptive Icon → Background: цвет `#11796F`.
