@@ -9,12 +9,13 @@ import 'package:flutter/material.dart';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// Unposted transfers from [warehouseKey] for the last [daysBack] days that
 /// were not checked by the TSD yet (no «Проверено ТСД» mark in the comment).
 ///
 /// Returns a JSON list for a ListView, newest first:
-/// `[{key, number, date, receiver, lines, comment}]`.
+/// `[{key, number, date, receiver, comment}]`.
 /// Throws a readable message (String) on connection / 1C errors.
 Future<List<dynamic>> getTransfersToCheck(
   String baseUrl,
@@ -30,52 +31,67 @@ Future<List<dynamic>> getTransfersToCheck(
       '${since.year.toString().padLeft(4, '0')}-${since.month.toString().padLeft(2, '0')}-'
       '${since.day.toString().padLeft(2, '0')}T00:00:00';
 
-  final filter = "Склад_Key eq guid'${warehouseKey.trim()}' and Posted eq false "
-      "and DeletionMark eq false and Date ge datetime'$sinceStr'";
-  final params = <String, String>{
-    r'$format': 'json',
-    r'$filter': filter,
-    r'$expand': 'СкладПолучатель',
-    r'$select': 'Ref_Key,Number,Date,Комментарий,Товары,СкладПолучатель/Description',
-    r'$orderby': 'Date desc',
-  };
-  final query = params.entries
-      .map((e) => '${e.key}=${Uri.encodeComponent(e.value)}')
-      .join('&');
-  final uri = Uri.parse(
-      '$root/odata/standard.odata/${Uri.encodeComponent('Document_ПеремещениеТоваров')}?$query');
-
   final auth = 'Basic ${base64Encode(utf8.encode('$username:$password'))}';
-  http.Response resp;
-  try {
-    resp = await http.get(uri, headers: {
-      'Authorization': auth,
-      'Accept': 'application/json',
-    }).timeout(const Duration(seconds: 30));
-  } catch (e) {
-    throw 'Нет связи с 1С ($root): $e';
-  }
-  if (resp.statusCode == 401) throw '1С: неверный логин или пароль';
-  if (resp.statusCode != 200) {
-    throw '1С: HTTP ${resp.statusCode} ${utf8.decode(resp.bodyBytes)}';
+
+  Future<List<Map<String, dynamic>>> get(String entity, Map<String, String> params) async {
+    final query = {r'$format': 'json', ...params}
+        .entries
+        .map((e) => '${e.key}=${Uri.encodeComponent(e.value)}')
+        .join('&');
+    final uri = Uri.parse('$root/odata/standard.odata/${Uri.encodeComponent(entity)}?$query');
+    http.Response resp;
+    try {
+      resp = await http.get(uri, headers: {'Authorization': auth, 'Accept': 'application/json'})
+          .timeout(const Duration(seconds: 30));
+    } catch (e) {
+      throw 'Нет связи с 1С ($root): $e';
+    }
+    if (resp.statusCode == 401) throw '1С: неверный логин или пароль';
+    final body = utf8.decode(resp.bodyBytes);
+    if (resp.statusCode != 200) throw '1С: HTTP ${resp.statusCode} $body';
+    return (((jsonDecode(body) as Map)['value'] as List?) ?? const []).cast<Map<String, dynamic>>();
   }
 
-  final data = jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
-  final rows = (data['value'] as List?) ?? const [];
-  final result = <dynamic>[];
-  for (final row in rows) {
-    final m = row as Map<String, dynamic>;
-    final comment = (m['Комментарий'] ?? '').toString();
-    if (comment.contains(checkedMark)) continue;
-    final receiver = m['СкладПолучатель'];
-    result.add({
-      'key': m['Ref_Key'],
-      'number': m['Number'],
-      'date': m['Date'],
-      'receiver': receiver is Map ? (receiver['Description'] ?? '') : '',
-      'lines': (m['Товары'] as List?)?.length ?? 0,
-      'comment': comment,
-    });
+  // Minimal request: no lines, no $expand.
+  final docs = await get('Document_ПеремещениеТоваров', {
+    r'$filter': "Склад_Key eq guid'${warehouseKey.trim()}' and Posted eq false "
+        "and DeletionMark eq false and Date ge datetime'$sinceStr'",
+    r'$select': 'Ref_Key,Number,Date,Комментарий,СкладПолучатель_Key',
+    r'$orderby': 'Date desc',
+  });
+  final pending = docs.where((m) => !(m['Комментарий'] ?? '').toString().contains(checkedMark)).toList();
+
+  // Store names: local cache for 24 h (shared with TransferListWidget).
+  final prefs = await SharedPreferences.getInstance();
+  Map<String, String> names = {};
+  var fresh = false;
+  try {
+    final m = jsonDecode(prefs.getString('tsdc_wh') ?? '{}') as Map<String, dynamic>;
+    fresh = DateTime.now().millisecondsSinceEpoch - ((m['ts'] as num?)?.toInt() ?? 0) <
+        const Duration(hours: 24).inMilliseconds;
+    names = (m['names'] as Map<String, dynamic>? ?? {}).map((k, v) => MapEntry(k, v.toString()));
+  } catch (_) {}
+  final needReload = !fresh ||
+      pending.any((m) {
+        final k = (m['СкладПолучатель_Key'] ?? '').toString();
+        return k.isNotEmpty && !names.containsKey(k);
+      });
+  if (needReload) {
+    try {
+      final rows = await get('Catalog_Склады', {r'$select': 'Ref_Key,Description'});
+      names = {for (final r in rows) r['Ref_Key'].toString(): (r['Description'] ?? '').toString()};
+      await prefs.setString('tsdc_wh', jsonEncode({'ts': DateTime.now().millisecondsSinceEpoch, 'names': names}));
+    } catch (_) {}
   }
-  return result;
+
+  return [
+    for (final m in pending)
+      {
+        'key': m['Ref_Key'],
+        'number': m['Number'],
+        'date': m['Date'],
+        'receiver': names[(m['СкладПолучатель_Key'] ?? '').toString()] ?? '',
+        'comment': m['Комментарий'] ?? '',
+      }
+  ];
 }

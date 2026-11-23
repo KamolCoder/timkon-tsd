@@ -49,12 +49,11 @@ class TransferListWidget extends StatefulWidget {
 }
 
 class _TransferRow {
-  _TransferRow(this.key, this.number, this.date, this.receiver, this.lines, this.started);
+  _TransferRow(this.key, this.number, this.date, this.receiver, this.started);
   final String key;
   final String number;
   final DateTime? date;
   final String receiver;
-  final int lines;
 
   /// a check of this document was started on this TSD (local progress exists)
   final bool started;
@@ -100,52 +99,78 @@ class _TransferListWidgetState extends State<TransferListWidget> {
       String two(int v) => v.toString().padLeft(2, '0');
       final sinceStr = '${since.year}-${two(since.month)}-${two(since.day)}T00:00:00';
 
-      final params = <String, String>{
-        r'$format': 'json',
+      // Minimal request: no lines, no $expand — store names come from the local cache.
+      final docs = await _get(root, 'Document_ПеремещениеТоваров', {
         r'$filter': "Склад_Key eq guid'${widget.warehouseKey.trim()}' and Posted eq false "
             "and DeletionMark eq false and Date ge datetime'$sinceStr'",
-        r'$expand': 'СкладПолучатель',
-        r'$select': 'Ref_Key,Number,Date,Комментарий,Товары,СкладПолучатель/Description',
+        r'$select': 'Ref_Key,Number,Date,Комментарий,СкладПолучатель_Key',
         r'$orderby': 'Date desc',
-      };
-      final query = params.entries.map((e) => '${e.key}=${Uri.encodeComponent(e.value)}').join('&');
-      final uri = Uri.parse(
-          '$root/odata/standard.odata/${Uri.encodeComponent('Document_ПеремещениеТоваров')}?$query');
-
-      http.Response resp;
-      try {
-        resp = await http.get(uri, headers: {
-          'Authorization': 'Basic ${base64Encode(utf8.encode('${widget.username}:${widget.password}'))}',
-          'Accept': 'application/json',
-        }).timeout(const Duration(seconds: 30));
-      } catch (e) {
-        throw 'Нет связи с 1С ($root): $e';
-      }
-      if (resp.statusCode == 401) throw '1С: неверный логин или пароль';
-      final body = utf8.decode(resp.bodyBytes);
-      if (resp.statusCode != 200) throw '1С: HTTP ${resp.statusCode} $body';
+      });
+      final pending = docs.where((m) => !(m['Комментарий'] ?? '').toString().contains(_checkedMark)).toList();
 
       final prefs = await SharedPreferences.getInstance();
-      final rows = <_TransferRow>[];
-      for (final r in ((jsonDecode(body)['value'] as List?) ?? const [])) {
-        final m = r as Map<String, dynamic>;
-        if ((m['Комментарий'] ?? '').toString().contains(_checkedMark)) continue;
-        final key = m['Ref_Key'].toString();
-        final rec = m['СкладПолучатель'];
-        rows.add(_TransferRow(
-          key,
-          (m['Number'] ?? '').toString(),
-          DateTime.tryParse((m['Date'] ?? '').toString()),
-          rec is Map ? (rec['Description'] ?? '').toString() : '',
-          (m['Товары'] as List?)?.length ?? 0,
-          prefs.containsKey('tsdcheck_$key'),
-        ));
-      }
-      _rows = rows;
+      final names = await _warehouseNames(
+          prefs, root, pending.map((m) => (m['СкладПолучатель_Key'] ?? '').toString()).toSet());
+
+      _rows = [
+        for (final m in pending)
+          _TransferRow(
+            m['Ref_Key'].toString(),
+            (m['Number'] ?? '').toString(),
+            DateTime.tryParse((m['Date'] ?? '').toString()),
+            names[(m['СкладПолучатель_Key'] ?? '').toString()] ?? '',
+            prefs.containsKey('tsdcheck_${m['Ref_Key']}'),
+          )
+      ];
     } catch (e) {
       _error = e.toString();
     }
     if (mounted) setState(() => _loading = false);
+  }
+
+  Future<List<Map<String, dynamic>>> _get(String root, String entity, Map<String, String> params) async {
+    final query = {r'$format': 'json', ...params}
+        .entries
+        .map((e) => '${e.key}=${Uri.encodeComponent(e.value)}')
+        .join('&');
+    final uri = Uri.parse('$root/odata/standard.odata/${Uri.encodeComponent(entity)}?$query');
+    http.Response resp;
+    try {
+      resp = await http.get(uri, headers: {
+        'Authorization': 'Basic ${base64Encode(utf8.encode('${widget.username}:${widget.password}'))}',
+        'Accept': 'application/json',
+      }).timeout(const Duration(seconds: 30));
+    } catch (e) {
+      throw 'Нет связи с 1С ($root): $e';
+    }
+    if (resp.statusCode == 401) throw '1С: неверный логин или пароль';
+    final body = utf8.decode(resp.bodyBytes);
+    if (resp.statusCode != 200) throw '1С: HTTP ${resp.statusCode} $body';
+    return (((jsonDecode(body) as Map)['value'] as List?) ?? const []).cast<Map<String, dynamic>>();
+  }
+
+  /// Warehouse names cached on the TSD for 24 h; reloaded (≈30 rows) only
+  /// when the cache is old or a store is missing in it.
+  Future<Map<String, String>> _warehouseNames(SharedPreferences prefs, String root, Set<String> needed) async {
+    const key = 'tsdc_wh';
+    Map<String, String> names = {};
+    var fresh = false;
+    try {
+      final m = jsonDecode(prefs.getString(key) ?? '{}') as Map<String, dynamic>;
+      final ts = (m['ts'] as num?)?.toInt() ?? 0;
+      fresh = DateTime.now().millisecondsSinceEpoch - ts < const Duration(hours: 24).inMilliseconds;
+      names = (m['names'] as Map<String, dynamic>? ?? {}).map((k, v) => MapEntry(k, v.toString()));
+    } catch (_) {}
+    final missing = needed.where((k) => k.isNotEmpty && !names.containsKey(k));
+    if (fresh && missing.isEmpty) return names;
+    try {
+      final rows = await _get(root, 'Catalog_Склады', {r'$select': 'Ref_Key,Description'});
+      names = {for (final r in rows) r['Ref_Key'].toString(): (r['Description'] ?? '').toString()};
+      await prefs.setString(key, jsonEncode({'ts': DateTime.now().millisecondsSinceEpoch, 'names': names}));
+    } catch (_) {
+      // Names are cosmetic: show the list anyway.
+    }
+    return names;
   }
 
   Future<void> _open(_TransferRow row) async {
@@ -200,7 +225,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
                       onTap: () => _open(r),
                       title: Text(r.receiver.isEmpty ? '№ ${r.number}' : r.receiver,
                           style: const TextStyle(fontWeight: FontWeight.w600)),
-                      subtitle: Text('№ ${r.number} · ${_date(r.date)} · строк: ${r.lines}'
+                      subtitle: Text('№ ${r.number} · ${_date(r.date)}'
                           '${r.started ? ' · проверка начата' : ''}'),
                       trailing: const Icon(Icons.chevron_right),
                     ),
