@@ -547,7 +547,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
     final now = DateTime.now();
     String two(int v) => v.toString().padLeft(2, '0');
-    final log = StringBuffer('Проверено ТСД: ${_checker.isEmpty ? 'ТСД' : _checker} '
+    final log = StringBuffer('[ТСД✓] Проверено: ${_checker.isEmpty ? 'ТСД' : _checker} '
         '${two(now.day)}.${two(now.month)} ${two(now.hour)}:${two(now.minute)}');
     if (excess.isNotEmpty) log.write('; излишек: ${excess.join(', ')}');
     if (shorts.isNotEmpty) log.write('; недостача: ${shorts.join(', ')}');

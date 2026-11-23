@@ -14,12 +14,19 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 /// Offline-first list of transfers on the TSD.
 ///
-/// «Загрузить» downloads unposted «Перемещение товаров» of the warehouse with
-/// their lines + names/units/barcodes of the goods (stored on the TSD). The
+/// «Загрузить» downloads today's «Перемещение товаров» of the warehouse (posted
+/// and unposted, not yet checked) with their lines + names/units/barcodes of
+/// the goods (stored on the TSD). The
 /// check itself (TransferCheckWidget) works without network. Checked documents
 /// are sent to 1C here: automatically after returning from the check page and
-/// with the «Отправить» button. A document changed / posted in 1C after the
-/// download is never overwritten (status «конфликт»).
+/// with the «Отправить» button. A posted document is re-posted (Unpost → write
+/// → Post).
+///
+/// One-time check: a sent document gets «[ТСД✓]» in its 1C comment; such
+/// documents are never downloaded again and a send is refused if the mark
+/// appeared meanwhile (another TSD) or the document changed in 1C after the
+/// download («конфликт»). Sent keys are also kept on the TSD for 7 days.
+/// To re-check, remove the «[ТСД✓]» line from the comment in 1C.
 ///
 /// Settings come from TsdSettingsWidget (SharedPreferences `tsd_settings`);
 /// non-empty parameters override them.
@@ -32,7 +39,6 @@ class TransferListWidget extends StatefulWidget {
     this.username,
     this.password,
     this.warehouseKey,
-    this.daysBack,
     this.onOpen,
     this.onSettings,
   });
@@ -47,7 +53,6 @@ class TransferListWidget extends StatefulWidget {
 
   /// Ref_Key of the sender warehouse (Склад_Key)
   final String? warehouseKey;
-  final int? daysBack;
 
   /// Action with one String parameter: transferKey → navigate to the check page
   final Future Function(String transferKey)? onOpen;
@@ -246,6 +251,11 @@ class _OData {
   Future<dynamic> patch(String path, Map<String, dynamic> body) =>
       _send(() => http.patch(_uri(path, const {}), headers: _headers, body: jsonEncode(body)));
 
+  /// Bound action of a document: Post / Unpost (non-operational posting).
+  Future<dynamic> action(String docPath, String name) => _send(() => http.post(
+      _uri('$docPath/$name', const {'PostingModeOperational': 'false'}),
+      headers: _headers));
+
   Future<dynamic> post(String path, Map<String, dynamic> body) =>
       _send(() => http.post(_uri(path, const {}), headers: _headers, body: jsonEncode(body)));
 }
@@ -253,7 +263,13 @@ class _OData {
 // ───────────────────────────── widget ─────────────────────────────
 
 const _zeroGuid = '00000000-0000-0000-0000-000000000000';
-const _checkedMark = 'Проверено ТСД';
+/// Mark of a document checked by a TSD (in Комментарий). «Проверено ТСД» is
+/// the mark of the earlier app version.
+const _mark = '[ТСД✓]';
+bool _hasMark(dynamic comment) {
+  final c = (comment ?? '').toString();
+  return c.contains(_mark) || c.contains('Проверено ТСД');
+}
 
 class _TransferListWidgetState extends State<TransferListWidget> {
   List<Map<String, dynamic>> _docs = []; // to check: new / work / checked / conflict
@@ -269,7 +285,6 @@ class _TransferListWidgetState extends State<TransferListWidget> {
   String _pass = '';
   String _warehouse = '';
   String _warehouseName = '';
-  int _days = 7;
 
   bool get _noSettings => _root.isEmpty || _warehouse.isEmpty;
 
@@ -298,7 +313,6 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     _pass = (widget.password?.isNotEmpty ?? false) ? widget.password! : (m['password'] ?? '').toString();
     _warehouse = pick(widget.warehouseKey, 'warehouseKey');
     _warehouseName = (m['warehouseName'] ?? '').toString();
-    _days = widget.daysBack ?? (m['daysBack'] is num ? (m['daysBack'] as num).toInt() : 7);
   }
 
   _OData get _od => _OData(_root, _user, _pass);
@@ -344,28 +358,32 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     try {
       final od = _od;
       final prefs = await SharedPreferences.getInstance();
-      final since = DateTime.now().subtract(Duration(days: _days < 0 ? 0 : _days));
+      // Today only (from 00:00), posted and unposted.
+      final now = DateTime.now();
       String two(int v) => v.toString().padLeft(2, '0');
-      final sinceStr = '${since.year}-${two(since.month)}-${two(since.day)}T00:00:00';
+      final sinceStr = '${now.year}-${two(now.month)}-${two(now.day)}T00:00:00';
 
       final remote = await od.getList(_OData.entity('Document_ПеремещениеТоваров'), {
-        r'$filter': "Склад_Key eq guid'$_warehouse' and Posted eq false "
-            "and DeletionMark eq false and Date ge datetime'$sinceStr'",
-        r'$select': 'Ref_Key,Number,Date,DataVersion,Комментарий,СкладПолучатель_Key,Товары',
+        r'$filter': "Склад_Key eq guid'$_warehouse' and DeletionMark eq false and Date ge datetime'$sinceStr'",
+        r'$select': 'Ref_Key,Number,Date,Posted,DataVersion,Комментарий,СкладПолучатель_Key,Товары',
         r'$orderby': 'Date desc',
       });
       final names =
           await _warehouseNames(prefs, od, remote.map((m) => (m['СкладПолучатель_Key'] ?? '').toString()).toSet());
 
-      var added = 0, updated = 0, removed = 0, conflicts = 0;
+      var added = 0, updated = 0, removed = 0, conflicts = 0, markLost = 0;
       final remoteKeys = <String>{};
       for (final m in remote) {
         final key = m['Ref_Key'].toString();
         remoteKeys.add(key);
-        final checkedElsewhere = (m['Комментарий'] ?? '').toString().contains(_checkedMark);
+        final checkedElsewhere = _hasMark(m['Комментарий']);
         final local = _Store.doc(prefs, key);
         final status = (local?['status'] ?? '').toString();
-        if (status == 'sent') continue; // history, already in 1C
+        if (status == 'sent') {
+          // Sent from this TSD: never again, even if the mark was erased in 1C.
+          if (!checkedElsewhere) markLost++;
+          continue;
+        }
 
         if (checkedElsewhere) {
           if (local == null) continue;
@@ -374,7 +392,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
             removed++;
           } else if (status != 'conflict') {
             local['status'] = 'conflict';
-            local['error'] = 'Уже проверен на другом ТСД';
+            local['error'] = 'Уже проверен (отметка $_mark в 1С)';
             await _Store.putDoc(prefs, local);
             conflicts++;
           }
@@ -398,7 +416,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
         }
       }
 
-      // Local documents no longer among the unposted ones in 1C.
+      // Local documents no longer among today's ones in 1C (deleted / date changed).
       for (final d in _Store.docs(prefs)) {
         final key = d['key'].toString();
         if (remoteKeys.contains(key)) continue;
@@ -409,7 +427,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
           removed++;
         } else if (status != 'conflict') {
           d['status'] = 'conflict';
-          d['error'] = 'Проведён, удалён или вне периода в 1С';
+          d['error'] = 'Удалён в 1С или дата не сегодня';
           await _Store.putDoc(prefs, d);
           conflicts++;
         }
@@ -420,7 +438,8 @@ class _TransferListWidgetState extends State<TransferListWidget> {
       await _Store.cleanup(prefs);
 
       _toast('Загружено: новых $added, обновлено $updated, убрано $removed'
-          '${conflicts > 0 ? ', конфликтов $conflicts' : ''}');
+          '${conflicts > 0 ? ', конфликтов $conflicts' : ''}'
+          '${markLost > 0 ? '. Внимание: у $markLost отправленных стёрта отметка $_mark в 1С' : ''}');
     } catch (e) {
       _error = e.toString();
     }
@@ -434,6 +453,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
         'date': (m['Date'] ?? '').toString(),
         'receiver': names[(m['СкладПолучатель_Key'] ?? '').toString()] ?? '',
         'dataVersion': m['DataVersion'],
+        'posted': m['Posted'] == true,
         'lines': [
           for (final row in ((m['Товары'] as List?) ?? const []).cast<Map<String, dynamic>>())
             {for (final e in row.entries) if (!e.key.contains('@')) e.key: e.value},
@@ -521,34 +541,72 @@ class _TransferListWidgetState extends State<TransferListWidget> {
 
   // ── send ──
 
-  /// true = sent and removed from the TSD; false = 1C refused (status saved);
-  /// throws _ODataError(network: true) when there is no connection.
+  /// true = written to 1C (moved to «Отправленные»); false = 1C refused
+/// (status saved); throws _ODataError(network: true) when there is no connection.
+  ///
+  /// Posted document: Unpost → write → Post. If posting fails the document
+  /// stays unposted with the new quantities (visible in 1C), never «posted
+  /// with old movements».
   Future<bool> _sendOne(SharedPreferences prefs, Map<String, dynamic> d) async {
     final key = d['key'].toString();
     final od = _od;
+    final path = _OData.entity('Document_ПеремещениеТоваров', key);
     try {
       Map<String, dynamic> fresh;
       try {
-        fresh = await od.getOne(_OData.entity('Document_ПеремещениеТоваров', key),
-            {r'$select': 'Posted,DeletionMark,DataVersion,Комментарий'});
+        fresh = await od.getOne(path, {r'$select': 'Posted,DeletionMark,DataVersion,Комментарий'});
       } on _ODataError catch (e) {
         if (e.status == 404) throw _ODataError('Документ удалён в 1С', status: 409);
         rethrow;
       }
-      if (fresh['Posted'] == true) throw _ODataError('Документ уже проведён в 1С', status: 409);
       if (fresh['DeletionMark'] == true) throw _ODataError('Документ помечен на удаление в 1С', status: 409);
+      if (_hasMark(fresh['Комментарий'])) {
+        throw _ODataError('Уже проверен (отметка $_mark в 1С) — повторная отправка запрещена', status: 409);
+      }
       if (fresh['DataVersion'] != d['dataVersion']) {
         throw _ODataError('Изменён в 1С после загрузки', status: 409);
       }
 
+      // repost: true when this TSD unposted it (now or in an interrupted earlier attempt)
+      var repost = d['repost'] == true;
+      if (fresh['Posted'] == true) {
+        await od.action(path, 'Unpost');
+        repost = true;
+        final v = await od.getOne(path, {r'$select': 'DataVersion'});
+        d['dataVersion'] = v['DataVersion'];
+        d['repost'] = true;
+        await _Store.putDoc(prefs, d);
+      }
+
       final result = d['result'] as Map<String, dynamic>;
+      var log = result['log'].toString();
+      if (!log.startsWith(_mark)) log = '$_mark $log';
       final old = (fresh['Комментарий'] ?? '').toString().trim();
-      final log = result['log'].toString();
-      await od.patch(_OData.entity('Document_ПеремещениеТоваров', key), {
-        'Товары': result['rows'],
-        'Комментарий': old.isEmpty ? log : '$old\n$log',
-      });
-      // Keep a light record for the «Отправленные» tab (no lines / goods).
+      try {
+        await od.patch(path, {
+          'Товары': result['rows'],
+          'Комментарий': old.isEmpty ? log : '$old\n$log',
+        });
+      } catch (e) {
+        if (repost && !(e is _ODataError && e.network)) {
+          try {
+            await od.action(path, 'Post'); // put the old version back as it was
+            d.remove('repost');
+          } catch (_) {}
+        }
+        rethrow;
+      }
+
+      String? postError;
+      if (repost) {
+        try {
+          await od.action(path, 'Post');
+        } on _ODataError catch (e) {
+          postError = e.message;
+        }
+      }
+
+      // Light record for «Отправленные» (no lines / goods); also guards against re-download.
       await _Store.putDoc(prefs, {
         'key': key,
         'number': d['number'],
@@ -558,6 +616,8 @@ class _TransferListWidgetState extends State<TransferListWidget> {
         'sentAt': DateTime.now().toIso8601String(),
         'linesCount': (result['rows'] as List?)?.length ?? 0,
         'log': log,
+        'reposted': repost && postError == null,
+        if (postError != null) 'postError': postError,
       });
       return true;
     } on _ODataError catch (e) {
@@ -590,12 +650,16 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     }
     if (mounted) setState(() => _busy = null);
     await _refreshLocal();
+    final notPosted = _sent.where((d) => d['postError'] != null && queue.any((q) => q['key'] == d['key'])).length;
     if (offline) {
       _toast('Нет связи с 1С — проверенные документы ждут отправки', error: true);
     } else if (failed > 0) {
       _toast('Отправлено $sent, не принято $failed (см. список)', error: true);
+    } else if (notPosted > 0) {
+      _toast('Отправлено $sent, но $notPosted не удалось провести — проведите в 1С (вкладка «Отправленные»)',
+          error: true);
     } else {
-      _toast('Отправлено в 1С: $sent. Проведите документы в 1С.');
+      _toast('Отправлено в 1С: $sent');
     }
   }
 
@@ -645,7 +709,8 @@ class _TransferListWidgetState extends State<TransferListWidget> {
         content: SingleChildScrollView(
           child: Text('Отправлено в 1С: ${_date((d['sentAt'] ?? '').toString())}\n'
               'Строк: ${d['linesCount'] ?? 0}\n\n${(d['log'] ?? '').toString().replaceAll('; ', '\n')}\n\n'
-              'Документ не проведён — проведите его в 1С.'),
+              '${d['postError'] != null ? 'ВНИМАНИЕ: перепровести не удалось — ${d['postError']}\n'
+                  'Документ не проведён, проведите его в 1С.' : d['reposted'] == true ? 'Документ перепроведён в 1С.' : 'Документ не проведён — проведите его в 1С.'}'),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Убрать из истории')),
@@ -712,7 +777,9 @@ class _TransferListWidgetState extends State<TransferListWidget> {
           padding: const EdgeInsets.all(24),
           child: Column(mainAxisSize: MainAxisSize.min, children: [
             Text(
-              _noSettings ? 'Укажите в настройках адрес 1С и склад' : 'На ТСД нет накладных.\nНажмите «Загрузить».',
+              _noSettings
+                  ? 'Укажите в настройках адрес 1С и склад'
+                  : 'На ТСД нет накладных за сегодня.\nНажмите «Загрузить».',
               textAlign: TextAlign.center,
             ),
             if (_noSettings && widget.onSettings != null) ...[
@@ -731,17 +798,18 @@ class _TransferListWidgetState extends State<TransferListWidget> {
           final status = (d['status'] ?? 'new').toString();
           final lines = (d['lines'] as List?)?.length ?? (d['linesCount'] as num?)?.toInt() ?? 0;
           final err = status == 'sent'
-              ? _date((d['sentAt'] ?? '').toString())
+              ? '${_date((d['sentAt'] ?? '').toString())}${d['postError'] != null ? ' · НЕ ПРОВЕДЁН' : ''}'
               : (d['error'] ?? '').toString();
           return Card(
             margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-            color: _statusColor[status],
+            color: d['postError'] != null ? const Color(0xFFFFCDD2) : _statusColor[status],
             child: ListTile(
               onTap: busy ? null : () => _open(d),
               title: Text(
                   (d['receiver'] ?? '').toString().isEmpty ? '№ ${d['number']}' : d['receiver'].toString(),
                   style: const TextStyle(fontWeight: FontWeight.w600)),
-              subtitle: Text('№ ${d['number']} · ${_date(d['date'].toString())} · строк: $lines\n'
+              subtitle: Text('№ ${d['number']} · ${_date(d['date'].toString())} · строк: $lines'
+                  '${d['posted'] == true ? ' · проведён' : ''}\n'
                   '${_statusText[status] ?? status}${err.isEmpty ? '' : ' · $err'}'),
               isThreeLine: true,
               trailing: Icon(status == 'conflict'

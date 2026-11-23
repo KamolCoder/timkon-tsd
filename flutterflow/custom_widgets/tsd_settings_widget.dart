@@ -39,7 +39,6 @@ class _TsdSettingsWidgetState extends State<TsdSettingsWidget> {
   final _user = TextEditingController();
   final _pass = TextEditingController();
   final _checker = TextEditingController();
-  final _days = TextEditingController(text: '7');
 
   String _warehouseKey = '';
   String _warehouseName = '';
@@ -58,7 +57,7 @@ class _TsdSettingsWidgetState extends State<TsdSettingsWidget> {
 
   @override
   void dispose() {
-    for (final c in [_url, _user, _pass, _checker, _days]) {
+    for (final c in [_url, _user, _pass, _checker]) {
       c.dispose();
     }
     super.dispose();
@@ -72,7 +71,6 @@ class _TsdSettingsWidgetState extends State<TsdSettingsWidget> {
       _user.text = (m['username'] ?? '').toString();
       _pass.text = (m['password'] ?? '').toString();
       _checker.text = (m['checkerName'] ?? '').toString();
-      _days.text = (m['daysBack'] ?? 7).toString();
       _warehouseKey = (m['warehouseKey'] ?? '').toString();
       _warehouseName = (m['warehouseName'] ?? '').toString();
     } catch (_) {}
@@ -142,7 +140,6 @@ class _TsdSettingsWidgetState extends State<TsdSettingsWidget> {
           'warehouseKey': _warehouseKey,
           'warehouseName': _warehouseName,
           'checkerName': _checker.text.trim(),
-          'daysBack': int.tryParse(_days.text.trim()) ?? 7,
         }));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Настройки сохранены')));
@@ -241,7 +238,6 @@ class _TsdSettingsWidgetState extends State<TsdSettingsWidget> {
               ),
               const SizedBox(height: 10),
               _field(_checker, 'Кладовщик (ФИО для комментария в 1С)'),
-              _field(_days, 'Показывать перемещения за дней', type: TextInputType.number),
             ]),
           ),
           Padding(
