@@ -138,6 +138,49 @@ class _OData {
       _send(() => http.post(_uri(path, const {}), headers: _headers, body: jsonEncode(body)));
 }
 
+// ───────────────────────────── local cache ─────────────────────────────
+
+/// Per-product cache on the TSD: name, units, barcodes. TTL 24 h, so the next
+/// document with the same goods opens without asking 1C. A stale entry is
+/// harmless: unknown barcodes / units are always checked online, «Обновить»
+/// bypasses the cache.
+/// Entry: {name, article, weight, base, units: [[ref, coef, classifier, deleted]],
+///         codes: [[barcode, charKey, unitKey]], ts}
+class _Cache {
+  static const ttl = Duration(hours: 24);
+  static const _prefix = 'tsdc_p_';
+
+  static Map<String, dynamic>? get(SharedPreferences prefs, String productKey) {
+    final s = prefs.getString('$_prefix$productKey');
+    if (s == null) return null;
+    try {
+      final m = jsonDecode(s) as Map<String, dynamic>;
+      final ts = DateTime.fromMillisecondsSinceEpoch((m['ts'] as num).toInt());
+      return DateTime.now().difference(ts) > ttl ? null : m;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> put(SharedPreferences prefs, String productKey, Map<String, dynamic> m) {
+    m['ts'] = DateTime.now().millisecondsSinceEpoch;
+    return prefs.setString('$_prefix$productKey', jsonEncode(m));
+  }
+
+  /// Drop entries older than a week so the cache does not grow forever.
+  static Future<void> cleanup(SharedPreferences prefs) async {
+    final border = DateTime.now().subtract(const Duration(days: 7)).millisecondsSinceEpoch;
+    for (final k in prefs.getKeys().where((k) => k.startsWith(_prefix)).toList()) {
+      try {
+        final ts = (jsonDecode(prefs.getString(k) ?? '{}')['ts'] as num?)?.toInt() ?? 0;
+        if (ts < border) await prefs.remove(k);
+      } catch (_) {
+        await prefs.remove(k);
+      }
+    }
+  }
+}
+
 // ───────────────────────────── model ─────────────────────────────
 
 const _zeroGuid = '00000000-0000-0000-0000-000000000000';
@@ -217,6 +260,9 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   final Map<String, String> _baseUnit = {};
   final Map<String, String> _unitClassifier = {};
 
+  /// productKey → cache entry (see _Cache)
+  final Map<String, Map<String, dynamic>> _entries = {};
+
   final StringBuffer _scanBuf = StringBuffer();
   bool _dialogOpen = false;
   String _lastScan = '';
@@ -239,7 +285,8 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   // ── loading ──
 
-  Future<void> _load() async {
+  /// [force] — ignore the local cache (the «Обновить» button).
+  Future<void> _load({bool force = false}) async {
     setState(() {
       _loading = true;
       _error = null;
@@ -250,8 +297,10 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       _barcodes.clear();
       _unitCoef.clear();
       _blocks.clear();
+      _entries.clear();
 
-      _doc = await _od.getOne(_OData.entity('Document_ПеремещениеТоваров', widget.transferKey));
+      _doc = await _od.getOne(_OData.entity('Document_ПеремещениеТоваров', widget.transferKey),
+          {r'$select': 'Number,Posted,DataVersion,Комментарий,Товары'});
       if (_doc['Posted'] == true) throw 'Документ уже проведён — проверка недоступна';
 
       for (final row in ((_doc['Товары'] as List?) ?? const []).cast<Map<String, dynamic>>()) {
@@ -266,47 +315,97 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       }
       final productKeys = _items.map((e) => e.productKey).toSet();
 
-      final products = await _od.getByKeys('Catalog_Номенклатура', 'Ref_Key', productKeys,
-          'Ref_Key,Description,Артикул,Весовой,ЕдиницаИзмерения_Key');
-      for (final p in products) {
-        final key = p['Ref_Key'].toString();
-        _baseUnit[key] = (p['ЕдиницаИзмерения_Key'] ?? _zeroGuid).toString();
-        for (final it in _items.where((i) => i.productKey == key)) {
-          it.name = (p['Description'] ?? '').toString();
-          it.article = (p['Артикул'] ?? '').toString();
-          it.weight = p['Весовой'] == true;
+      final prefs = await SharedPreferences.getInstance();
+      final missing = <String>[];
+      for (final p in productKeys) {
+        final e = force ? null : _Cache.get(prefs, p);
+        if (e == null) {
+          missing.add(p);
+        } else {
+          _entries[p] = e;
         }
       }
-
-      final units = await _od.getByKeys('Catalog_ЕдиницыИзмерения', 'Owner_Key', productKeys,
-          'Ref_Key,Owner_Key,Коэффициент,DeletionMark,ЕдиницаИзмеренияПоКлассификатору_Key');
-      for (final u in units) {
-        final coef = _num(u['Коэффициент']);
-        final ref = u['Ref_Key'].toString();
-        _unitCoef[ref] = coef <= 0 ? 1 : coef;
-        _unitClassifier[ref] = (u['ЕдиницаИзмеренияПоКлассификатору_Key'] ?? _zeroGuid).toString();
-        if (u['DeletionMark'] != true && coef > 1) {
-          final owner = u['Owner_Key'].toString();
-          _blocks[owner] = math.max(_blocks[owner] ?? 0, coef);
-        }
-      }
-
-      final codes = await _od.getByKeys('InformationRegister_ШтрихкодыНоменклатуры', 'Номенклатура_Key',
-          productKeys, 'Штрихкод,Номенклатура_Key,ХарактеристикаНоменклатуры_Key,ЕдиницаИзмерения_Key,НеИспользуется');
-      for (final b in codes) {
-        if (b['НеИспользуется'] == true) continue;
-        _barcodes[b['Штрихкод'].toString().trim()] = [
-          b['Номенклатура_Key'].toString(),
-          (b['ХарактеристикаНоменклатуры_Key'] ?? _zeroGuid).toString(),
-          (b['ЕдиницаИзмерения_Key'] ?? _zeroGuid).toString(),
-        ];
-      }
+      if (missing.isNotEmpty) await _fetchProducts(prefs, missing);
+      _entries.forEach(_apply);
 
       await _restoreProgress();
+      unawaited(_Cache.cleanup(prefs));
     } catch (e) {
       _error = e.toString();
     }
     if (mounted) setState(() => _loading = false);
+  }
+
+  /// Names, units and barcodes from 1C only for products missing in the cache.
+  Future<void> _fetchProducts(SharedPreferences prefs, List<String> keys) async {
+    final fresh = {
+      for (final p in keys)
+        p: <String, dynamic>{
+          'name': p.substring(0, 8),
+          'article': '',
+          'weight': false,
+          'base': _zeroGuid,
+          'units': <dynamic>[],
+          'codes': <dynamic>[],
+        }
+    };
+
+    for (final p in await _od.getByKeys('Catalog_Номенклатура', 'Ref_Key', keys,
+        'Ref_Key,Description,Артикул,Весовой,ЕдиницаИзмерения_Key')) {
+      final e = fresh[p['Ref_Key'].toString()];
+      if (e == null) continue;
+      e['name'] = (p['Description'] ?? '').toString();
+      e['article'] = (p['Артикул'] ?? '').toString();
+      e['weight'] = p['Весовой'] == true;
+      e['base'] = (p['ЕдиницаИзмерения_Key'] ?? _zeroGuid).toString();
+    }
+
+    for (final u in await _od.getByKeys('Catalog_ЕдиницыИзмерения', 'Owner_Key', keys,
+        'Ref_Key,Owner_Key,Коэффициент,DeletionMark,ЕдиницаИзмеренияПоКлассификатору_Key')) {
+      (fresh[u['Owner_Key'].toString()]?['units'] as List?)?.add([
+        u['Ref_Key'].toString(),
+        _num(u['Коэффициент']),
+        (u['ЕдиницаИзмеренияПоКлассификатору_Key'] ?? _zeroGuid).toString(),
+        u['DeletionMark'] == true,
+      ]);
+    }
+
+    for (final b in await _od.getByKeys('InformationRegister_ШтрихкодыНоменклатуры', 'Номенклатура_Key', keys,
+        'Штрихкод,Номенклатура_Key,ХарактеристикаНоменклатуры_Key,ЕдиницаИзмерения_Key,НеИспользуется')) {
+      if (b['НеИспользуется'] == true) continue;
+      (fresh[b['Номенклатура_Key'].toString()]?['codes'] as List?)?.add([
+        b['Штрихкод'].toString().trim(),
+        (b['ХарактеристикаНоменклатуры_Key'] ?? _zeroGuid).toString(),
+        (b['ЕдиницаИзмерения_Key'] ?? _zeroGuid).toString(),
+      ]);
+    }
+
+    for (final e in fresh.entries) {
+      _entries[e.key] = e.value;
+      await _Cache.put(prefs, e.key, e.value);
+    }
+  }
+
+  /// Cache entry → in-memory maps.
+  void _apply(String productKey, Map<String, dynamic> e) {
+    _baseUnit[productKey] = (e['base'] ?? _zeroGuid).toString();
+    for (final it in _items.where((i) => i.productKey == productKey)) {
+      it.name = (e['name'] ?? it.name).toString();
+      it.article = (e['article'] ?? '').toString();
+      it.weight = e['weight'] == true;
+    }
+    for (final u in (e['units'] as List? ?? const [])) {
+      final ref = u[0].toString();
+      final coef = _num(u[1]);
+      _unitCoef[ref] = coef <= 0 ? 1 : coef;
+      _unitClassifier[ref] = u[2].toString();
+      if (u[3] != true && coef > 1) {
+        _blocks[productKey] = math.max(_blocks[productKey] ?? 0, coef);
+      }
+    }
+    for (final c in (e['codes'] as List? ?? const [])) {
+      _barcodes[c[0].toString()] = [productKey, c[1].toString(), c[2].toString()];
+    }
   }
 
   // ── local progress (survives app restart / dead battery) ──
@@ -383,6 +482,32 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     if (hit == null) {
       _alarm('Неизвестный штрихкод $code');
       return;
+    }
+
+    // Barcode of a unit we have not seen (created in 1C after caching) — ask its coefficient.
+    if (hit[2] != _zeroGuid && !_unitCoef.containsKey(hit[2])) {
+      try {
+        final u = await _od.getOne(_OData.entity('Catalog_ЕдиницыИзмерения', hit[2]),
+            {r'$select': 'Ref_Key,Коэффициент,DeletionMark,ЕдиницаИзмеренияПоКлассификатору_Key'});
+        final coef = _num(u['Коэффициент']);
+        _unitCoef[hit[2]] = coef <= 0 ? 1 : coef;
+        final e = _entries[hit[0]];
+        if (e != null) {
+          (e['units'] as List).add(
+              [hit[2], coef, (u['ЕдиницаИзмеренияПоКлассификатору_Key'] ?? _zeroGuid).toString(), u['DeletionMark'] == true]);
+          if (coef > 1 && u['DeletionMark'] != true) {
+            _blocks[hit[0]] = math.max(_blocks[hit[0]] ?? 0, coef);
+          }
+        }
+      } catch (_) {
+        _unitCoef[hit[2]] = 1;
+      }
+    }
+    // A barcode found online for a product of this document: remember it in the cache.
+    final entry = _entries[hit[0]];
+    if (entry != null && !(entry['codes'] as List).any((c) => c[0] == code)) {
+      (entry['codes'] as List).add([code, hit[1], hit[2]]);
+      unawaited(SharedPreferences.getInstance().then((p) => _Cache.put(p, hit![0], entry)));
     }
 
     final qty = _unitCoef[hit[2]] ?? 1;
@@ -462,12 +587,20 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     // Remember in 1C as a unit «блок» of this product (like a package).
     try {
       final base = _baseUnit[it.productKey] ?? _zeroGuid;
-      await _od.post(_OData.entity('Catalog_ЕдиницыИзмерения'), {
+      final cls = _unitClassifier[base] ?? _zeroGuid;
+      final created = await _od.post(_OData.entity('Catalog_ЕдиницыИзмерения'), {
         'Owner_Key': it.productKey,
         'Description': 'блок ${_fmt(k)}',
         'Коэффициент': k,
-        'ЕдиницаИзмеренияПоКлассификатору_Key': _unitClassifier[base] ?? _zeroGuid,
+        'ЕдиницаИзмеренияПоКлассификатору_Key': cls,
       });
+      final ref = created is Map ? created['Ref_Key']?.toString() : null;
+      final entry = _entries[it.productKey];
+      if (ref != null && entry != null) {
+        _unitCoef[ref] = k;
+        (entry['units'] as List).add([ref, k, cls, false]);
+        await _Cache.put(await SharedPreferences.getInstance(), it.productKey, entry);
+      }
       _toast('Кратность ${_fmt(k)} сохранена в 1С');
     } catch (e) {
       _toast('Кратность учтена только в этой проверке: $e');
@@ -617,7 +750,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
           child: Column(mainAxisSize: MainAxisSize.min, children: [
             Text(_error!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.red)),
             const SizedBox(height: 12),
-            FilledButton(onPressed: _load, child: const Text('Повторить')),
+            FilledButton(onPressed: () => _load(force: true), child: const Text('Повторить')),
           ]),
         ),
       );
@@ -663,7 +796,10 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
                 if (code != null && code.isNotEmpty) await _onScan(code);
               },
             ),
-            IconButton(tooltip: 'Обновить', icon: const Icon(Icons.refresh), onPressed: _saving ? null : _load),
+            IconButton(
+                tooltip: 'Обновить из 1С (без кэша)',
+                icon: const Icon(Icons.refresh),
+                onPressed: _saving ? null : () => _load(force: true)),
           ]),
         ),
         Expanded(

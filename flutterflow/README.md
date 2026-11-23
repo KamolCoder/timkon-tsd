@@ -8,17 +8,27 @@
 
 | Файл | Тип в FlutterFlow |
 |---|---|
-| `custom_actions/get_transfers_to_check.dart` | Custom Action `getTransfersToCheck` |
-| `custom_widgets/transfer_check_widget.dart` | Custom Widget `TransferCheckWidget` |
+| `custom_widgets/transfer_list_widget.dart` | Custom Widget `TransferListWidget` — список к проверке |
+| `custom_widgets/transfer_check_widget.dart` | Custom Widget `TransferCheckWidget` — экран проверки |
+| `custom_actions/get_transfers_to_check.dart` | Custom Action `getTransfersToCheck` — то же, что список, но JSON для своего ListView (не нужен, если используете `TransferListWidget`) |
 
 Зависимости: `http`, `shared_preferences` (в FlutterFlow: Custom Code → Dependencies, если ещё не добавлены).
 
-## 1. Custom Action `getTransfersToCheck`
+## 0. Custom Widget `TransferListWidget`
+
+Параметры: `baseUrl`, `username`, `password`, `warehouseKey` (String), `daysBack` (int, по умолчанию 7),
+`onOpen` — Action **с параметром `transferKey` (String)**: Navigate To «Проверка» с этим ключом.
+Размер: на весь экран.
+
+Поиск по номеру/магазину, обновление свайпом вниз и кнопкой. Жёлтым подсвечены документы,
+проверку которых начали на этом ТСД. После возврата со страницы проверки список обновляется сам.
+
+## 1. Custom Action `getTransfersToCheck` (необязательно)
 
 Аргументы: `baseUrl` (String), `username` (String), `password` (String), `warehouseKey` (String), `daysBack` (int).
 Return Type: **JSON, List**.
 
-Элемент списка: `key`, `number`, `date`, `receiver`, `lines`, `comment`.
+Элемент списка: `key`, `number`, `date`, `receiver`, `comment`.
 В списке нет перемещений, у которых в комментарии уже стоит «Проверено ТСД».
 
 `warehouseKey` основного склада: `c1d8b115-3257-11ef-8278-00155d642b01`.
@@ -31,8 +41,9 @@ Return Type: **JSON, List**.
 
 ## 3. Страницы
 
-1. **Список**: On Page Load → `getTransfersToCheck` → ListView. Тап по строке → страница проверки с `key`.
-2. **Проверка**: только `TransferCheckWidget` с `transferKey`; `onSaved` → Navigate Back (список обновится на On Page Load).
+1. **Настройки**: поля → App State `baseUrl`, `username`, `password`, `warehouseKey`, `checkerName`.
+2. **Список**: только `TransferListWidget`; `onOpen(transferKey)` → Navigate To «Проверка» (параметр страницы `transferKey`).
+3. **Проверка**: только `TransferCheckWidget` с `transferKey`; `onSaved` → Navigate Back (список обновится сам).
 
 Адрес, логин, пароль и склад удобно держать в App State (persisted).
 `baseUrl` = `http://<IP сервера>/tbase` — по IP, не по имени `srv1`.
@@ -43,7 +54,35 @@ Return Type: **JSON, List**.
 Custom Code → Configuration Files → `AndroidManifest.xml` → в тег `<application>` добавить
 `android:usesCleartextTraffic="true"`.
 
-## 5. Сканер
+## 5. Нагрузка на 1С (сделать один раз на сервере)
+
+**Пул сеансов.** Без него каждый запрос открывает новый сеанс 1С (0,5–2 с на сервере и лицензия на время запроса).
+В `default.vrd` публикации (каталог публикации на IIS/Apache) внутри `<point …>`:
+
+```xml
+<standardOdata enable="true" reuseSessions="autouse" sessionMaxAge="20" poolSize="5" poolTimeout="5"/>
+```
+
+Перезапустить IIS/Apache. Если такая строка уже есть, добавить в неё атрибуты.
+Если веб-сервер после этого не стартует, платформа не поддерживает атрибуты: вернуть `<standardOdata enable="true"/>`.
+
+**Сжатие gzip** (JSON сжимается в 5–10 раз, приложение само шлёт `Accept-Encoding: gzip`):
+- IIS: роль «Dynamic Content Compression», в `applicationHost.config` → `dynamicTypes` добавить `application/json` и `application/json;odata=*` (enabled="true");
+- Apache: `AddOutputFilterByType DEFLATE application/json`.
+
+**Что грузит приложение:**
+| Действие | Запросы |
+|---|---|
+| Список | 1 (шапки без строк) + раз в сутки справочник складов |
+| Открыть документ, товары уже в кэше | 1 |
+| Открыть документ, товаров нет в кэше | 1 + 3 × ⌈N / 15⌉ (N — новых товаров) |
+| Неизвестный штрихкод | 1–2 |
+| Отправка | 1 GET + 1 PATCH |
+
+Кэш товаров, единиц и штрихкодов хранится на ТСД 24 ч, старше 7 дней удаляется.
+Кнопка ⟳ на экране проверки грузит документ из 1С без кэша.
+
+## 6. Сканер
 
 Режим ТСД — **эмуляция клавиатуры, суффикс Enter**. Виджет ловит коды сам, поле ввода не нужно.
 Без сканера: кнопка ⌨ в шапке.
