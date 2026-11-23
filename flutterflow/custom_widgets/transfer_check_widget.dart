@@ -15,10 +15,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// Offline check of one «Перемещение товаров» downloaded by TransferListWidget.
 /// No network here: the document, names, units and barcodes are on the TSD.
 ///
-/// Scanner: keyboard-wedge mode (code + Enter). A block barcode (unit with
-/// Коэффициент > 1) adds the whole block.
-/// Line rule: rounded = ceil(plan / k) * k; plan < fact <= rounded and
-/// fact % k == 0 is OK (rounded up to the block). Other excess is allowed
+/// Scanner: keyboard-wedge mode (code + Enter). A barcode of a 1C unit with
+/// Коэффициент > 1 (package) prefills that quantity.
+/// Line rule: fact = plan → OK, less → shortage, more → excess. Excess is allowed
 /// after confirmation and listed in the comment («излишек»).
 /// «Готово» stores the result on the TSD (status «checked»); TransferListWidget
 /// sends it to 1C. Posting stays manual in 1C.
@@ -70,16 +69,13 @@ class _Store {
       p.setString('$docPrefix${d['key']}', jsonEncode(d));
 
   static Map<String, dynamic>? prod(SharedPreferences p, String key) => read(p, '$prodPrefix$key');
-
-  static Future<void> putProd(SharedPreferences p, String key, Map<String, dynamic> e) =>
-      p.setString('$prodPrefix$key', jsonEncode(e));
 }
 
 // ───────────────────────────── model ─────────────────────────────
 
 const _zeroGuid = '00000000-0000-0000-0000-000000000000';
 
-enum _St { pending, ok, block, short, excess, askBlock, foreign }
+enum _St { pending, ok, short, excess, foreign }
 
 class _DocLine {
   _DocLine(this.raw);
@@ -110,23 +106,13 @@ String _fmt(double v) {
   return r == r.roundToDouble() ? r.toInt().toString() : r.toString();
 }
 
-bool _isMultiple(double v, double k) {
-  final q = v / k;
-  return (q - q.round()).abs() < 1e-6;
-}
-
-/// The agreed rule, k = block size (null = unknown).
-_St _status(_Item it, double? k) {
+/// fact vs plan.
+_St _status(_Item it) {
   final plan = it.plan, fact = it.fact;
   if (!it.inDoc) return fact > 0 ? _St.foreign : _St.pending;
   if (fact == 0) return _St.pending;
   if ((fact - plan).abs() < 1e-6) return _St.ok;
-  if (fact < plan) return _St.short;
-  if (it.weight) return _St.excess;
-  if (k == null || k <= 1) return _St.askBlock;
-  final rounded = (plan / k).ceil() * k;
-  if (fact <= rounded + 1e-6 && _isMultiple(fact, k)) return _St.block;
-  return _St.excess;
+  return fact < plan ? _St.short : _St.excess;
 }
 
 // ───────────────────────────── state ─────────────────────────────
@@ -147,9 +133,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   final Map<String, String> _otherNames = {};
 
   final Map<String, double> _unitCoef = {};
-  final Map<String, double> _blocks = {};
-  final Map<String, String> _baseUnit = {};
-  final Map<String, String> _unitClassifier = {};
 
   String _checker = '';
   final StringBuffer _scanBuf = StringBuffer();
@@ -211,7 +194,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   }
 
   void _apply(String productKey, Map<String, dynamic> e) {
-    _baseUnit[productKey] = (e['base'] ?? _zeroGuid).toString();
     for (final it in _items.where((i) => i.productKey == productKey)) {
       it.name = (e['name'] ?? it.name).toString();
       it.article = (e['article'] ?? '').toString();
@@ -221,8 +203,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       final ref = u[0].toString();
       final coef = _num(u[1]);
       _unitCoef[ref] = coef <= 0 ? 1 : coef;
-      _unitClassifier[ref] = u[2].toString();
-      if (u[3] != true && coef > 1) _blocks[productKey] = math.max(_blocks[productKey] ?? 0, coef);
     }
     for (final c in (e['codes'] as List? ?? const [])) {
       _barcodes[c[0].toString()] = [productKey, c[1].toString(), c[2].toString()];
@@ -260,7 +240,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       _byKey[it.key] = it;
     }
     (m['facts'] as Map<String, dynamic>? ?? {}).forEach((k, v) => _byKey[k]?.fact = _num(v));
-    (m['blocks'] as Map<String, dynamic>? ?? {}).forEach((k, v) => _blocks[k] = _num(v));
   }
 
   Future<void> _saveProgress() async {
@@ -269,7 +248,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       'foreign': [
         for (final i in _items.where((i) => !i.inDoc)) {'p': i.productKey, 'c': i.charKey, 'n': i.name, 'f': i.fact}
       ],
-      'blocks': _blocks,
     };
     // Any change after «Готово» needs «Готово» again.
     _doc['status'] = 'work';
@@ -335,7 +313,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
         _byKey[it.key] = it;
       }
       it.fact += qty;
-      final st = _status(it, _blocks[it.productKey]);
+      final st = _status(it);
       if (st == _St.foreign || st == _St.excess) {
         _alarm(st == _St.foreign ? 'Нет в документе: ${it.name}' : 'Больше заказа: ${it.name}');
       } else {
@@ -386,7 +364,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
               ),
             if (it != null && it.inDoc)
               Text('План ${_fmt(it.plan)} · собрано ${_fmt(it.fact)}', style: const TextStyle(fontSize: 16)),
-            if (step > 1) Text('Штрихкод блока: ${_fmt(step)} шт'),
+            if (step > 1) Text('Штрихкод упаковки: ${_fmt(step)} шт'),
             const SizedBox(height: 8),
             TextField(
               controller: ctrl,
@@ -412,7 +390,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   Future<void> _toggleAsk() async {
     setState(() => _askQty = !_askQty);
     (await SharedPreferences.getInstance()).setBool('tsd_ask_qty', _askQty);
-    _toast(_askQty ? 'Скан → спрашивать количество' : 'Скан → сразу +1 (блок — весь блок)');
+    _toast(_askQty ? 'Скан → спрашивать количество' : 'Скан → сразу +1 (упаковка — её количество)');
   }
 
   void _alarm(String msg) {
@@ -467,35 +445,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     await _saveProgress();
   }
 
-  /// fact > plan, block size unknown: «is it a block? how many in it?»
-  /// Applied at once on the TSD; the unit «блок N» goes to 1C with the document.
-  Future<void> _askBlock(_Item it) async {
-    final k = await _askNumber('Округление до блока?\n${it.name}', 'Штук в блоке (0 — это лишнее)', 0);
-    if (k == null || k <= 1) return;
-    setState(() => _blocks[it.productKey] = k);
-
-    final cls = _unitClassifier[_baseUnit[it.productKey] ?? _zeroGuid] ?? _zeroGuid;
-    final units = ((_doc['units'] as List?) ?? <dynamic>[])
-      ..removeWhere((u) => u is Map && u['Owner_Key'] == it.productKey);
-    units.add({
-      'Owner_Key': it.productKey,
-      'Description': 'блок ${_fmt(k)}',
-      'Коэффициент': k,
-      'ЕдиницаИзмеренияПоКлассификатору_Key': cls,
-    });
-    _doc['units'] = units;
-
-    // Other documents on the TSD learn the block too.
-    final prefs = await SharedPreferences.getInstance();
-    final e = _Store.prod(prefs, it.productKey);
-    if (e != null) {
-      (e['units'] as List).add(['local', k, cls, false]);
-      await _Store.putProd(prefs, it.productKey, e);
-    }
-    await _saveProgress();
-    _toast('Блок ${_fmt(k)} шт учтён');
-  }
-
   Future<bool> _confirm(String title, String text, String ok) async {
     _dialogOpen = true;
     final res = await showDialog<bool>(
@@ -517,20 +466,19 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   Future<void> _finish() async {
     // Goods not in the document cannot be written into it (no line, price) — remove them.
-    final foreign = _items.where((i) => _status(i, _blocks[i.productKey]) == _St.foreign).toList();
+    final foreign = _items.where((i) => _status(i) == _St.foreign).toList();
     if (foreign.isNotEmpty) {
       _alarm('Нет в документе — уберите или поставьте 0: ${foreign.map((i) => i.name).join(', ')}');
       return;
     }
 
     // Excess is allowed: 1C gets the actual quantity, the comment lists it.
-    final rounded = <String>[], shorts = <String>[], excess = <String>[];
+    final shorts = <String>[], excess = <String>[];
     for (final i in _items.where((i) => i.inDoc)) {
-      final s = _status(i, _blocks[i.productKey]);
+      final s = _status(i);
       final line = '${i.name} ${_fmt(i.plan)}→${_fmt(i.fact)}';
-      if (s == _St.block) rounded.add(line);
       if (s == _St.short || s == _St.pending) shorts.add(line);
-      if (s == _St.excess || s == _St.askBlock) excess.add(line);
+      if (s == _St.excess) excess.add(line);
     }
     if (shorts.isNotEmpty || excess.isNotEmpty) {
       final text = [
@@ -568,7 +516,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     String two(int v) => v.toString().padLeft(2, '0');
     final log = StringBuffer('Проверено ТСД: ${_checker.isEmpty ? 'ТСД' : _checker} '
         '${two(now.day)}.${two(now.month)} ${two(now.hour)}:${two(now.minute)}');
-    if (rounded.isNotEmpty) log.write('; округлено: ${rounded.join(', ')}');
     if (excess.isNotEmpty) log.write('; излишек: ${excess.join(', ')}');
     if (shorts.isNotEmpty) log.write('; недостача: ${shorts.join(', ')}');
 
@@ -602,25 +549,21 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   static const _colors = {
     _St.pending: Color(0xFFEEEEEE),
     _St.ok: Color(0xFFC8E6C9),
-    _St.block: Color(0xFFDCEDC8),
     _St.short: Color(0xFFFFF59D),
     _St.excess: Color(0xFFFFCDD2),
-    _St.askBlock: Color(0xFFFFE0B2),
     _St.foreign: Color(0xFFFFCDD2),
   };
 
   static const _labels = {
     _St.pending: 'не собрано',
     _St.ok: 'совпало',
-    _St.block: 'блок',
     _St.short: 'недостача',
     _St.excess: 'излишек',
-    _St.askBlock: 'излишек (если это блок — «Блок?»)',
     _St.foreign: 'нет в документе',
   };
 
   int _rank(_St s) =>
-      const [_St.foreign, _St.excess, _St.askBlock, _St.short, _St.pending, _St.block, _St.ok].indexOf(s);
+      const [_St.foreign, _St.excess, _St.short, _St.pending, _St.ok].indexOf(s);
 
   Future<void> _manualCode() async {
     final ctrl = TextEditingController();
@@ -657,10 +600,10 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       );
     } else {
       final sorted = [..._items]..sort((a, b) =>
-          _rank(_status(a, _blocks[a.productKey])).compareTo(_rank(_status(b, _blocks[b.productKey]))));
+          _rank(_status(a)).compareTo(_rank(_status(b))));
       final done = _items.where((i) {
-        final s = _status(i, _blocks[i.productKey]);
-        return s == _St.ok || s == _St.block;
+        final s = _status(i);
+        return s == _St.ok;
       }).length;
       final inDoc = _items.where((i) => i.inDoc).length;
       final checked = _doc['status'] == 'checked';
@@ -700,8 +643,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
             itemCount: sorted.length,
             itemBuilder: (ctx, i) {
               final it = sorted[i];
-              final k = _blocks[it.productKey];
-              final st = _status(it, k);
+              final st = _status(it);
               return Card(
                 color: _colors[st],
                 margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
@@ -711,11 +653,9 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
                   title: Text(it.name, maxLines: 2, overflow: TextOverflow.ellipsis),
                   subtitle: Text([
                     if (it.article.isNotEmpty) 'арт. ${it.article}',
-                    if (k != null && k > 1) 'блок ${_fmt(k)}',
                     _labels[st]!,
                   ].join(' · ')),
                   trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                    if (st == _St.askBlock) TextButton(onPressed: () => _askBlock(it), child: const Text('Блок?')),
                     Text('${_fmt(it.fact)} / ${_fmt(it.plan)}',
                         style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                   ]),

@@ -64,7 +64,7 @@ class TransferListWidget extends StatefulWidget {
 /// SharedPreferences layout:
 ///  tsd_docs            — JSON list of document keys on the TSD
 ///  tsd_doc_KEY         — {key, number, date, receiver, dataVersion, lines, status,
-///                         progress, result, units, error, loadedAt}
+///                         progress, result, error, loadedAt}
 ///                         status: new | work | checked | conflict | sent
 ///                         (sent: lines dropped, kept 7 days as history)
 ///  tsd_prod_PRODUCT    — {name, article, weight, base, units, codes, ts}
@@ -539,13 +539,6 @@ class _TransferListWidgetState extends State<TransferListWidget> {
       if (fresh['DeletionMark'] == true) throw _ODataError('Документ помечен на удаление в 1С', status: 409);
       if (fresh['DataVersion'] != d['dataVersion']) {
         throw _ODataError('Изменён в 1С после загрузки', status: 409);
-      }
-
-      // Block sizes learned on the TSD → units of the products in 1C (best effort).
-      for (final u in (d['units'] as List? ?? const [])) {
-        try {
-          await od.post(_OData.entity('Catalog_ЕдиницыИзмерения'), Map<String, dynamic>.from(u as Map));
-        } catch (_) {}
       }
 
       final result = d['result'] as Map<String, dynamic>;
