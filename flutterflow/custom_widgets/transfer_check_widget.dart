@@ -23,34 +23,37 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// fact % k == 0 is OK (rounded up to the block).
 /// Save: writes the actual quantities into Товары + a log in Комментарий.
 /// The document is NOT posted — the storekeeper posts it in 1C.
+///
+/// Connection settings come from TsdSettingsWidget (SharedPreferences
+/// `tsd_settings`); non-empty parameters override them.
 class TransferCheckWidget extends StatefulWidget {
   const TransferCheckWidget({
     super.key,
     this.width,
     this.height,
-    required this.baseUrl,
-    required this.username,
-    required this.password,
     required this.transferKey,
-    required this.checkerName,
+    this.baseUrl,
+    this.username,
+    this.password,
+    this.checkerName,
     this.onSaved,
   });
 
   final double? width;
   final double? height;
 
-  /// e.g. http://192.168.1.10/tbase
-  final String baseUrl;
-  final String username;
-  final String password;
-
   /// Ref_Key of Document_ПеремещениеТоваров
   final String transferKey;
 
-  /// Who checks — goes to the 1C comment
-  final String checkerName;
+  /// Optional overrides of the saved settings, e.g. http://192.168.1.10/tbase
+  final String? baseUrl;
+  final String? username;
+  final String? password;
 
-  /// Called after a successful save (navigate back, refresh the list…)
+  /// Who checks — goes to the 1C comment
+  final String? checkerName;
+
+  /// After a successful save. Default: go back to the list (Navigator.maybePop).
   final Future Function()? onSaved;
 
   @override
@@ -238,7 +241,8 @@ _St _status(_Item it, double? k) {
 // ───────────────────────────── state ─────────────────────────────
 
 class _TransferCheckWidgetState extends State<TransferCheckWidget> {
-  late _OData _od;
+  _OData _od = _OData('', '', '');
+  String _checker = '';
   bool _loading = true;
   bool _saving = false;
   String? _error;
@@ -272,7 +276,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   @override
   void initState() {
     super.initState();
-    _od = _OData(widget.baseUrl, widget.username, widget.password);
     HardwareKeyboard.instance.addHandler(_onKey);
     _load();
   }
@@ -299,6 +302,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       _blocks.clear();
       _entries.clear();
 
+      await _readSettings();
       _doc = await _od.getOne(_OData.entity('Document_ПеремещениеТоваров', widget.transferKey),
           {r'$select': 'Number,Posted,DataVersion,Комментарий,Товары'});
       if (_doc['Posted'] == true) throw 'Документ уже проведён — проверка недоступна';
@@ -334,6 +338,20 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       _error = e.toString();
     }
     if (mounted) setState(() => _loading = false);
+  }
+
+  Future<void> _readSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    Map<String, dynamic> m = {};
+    try {
+      m = jsonDecode(prefs.getString('tsd_settings') ?? '{}') as Map<String, dynamic>;
+    } catch (_) {}
+    String pick(String? param, String key) =>
+        (param != null && param.isNotEmpty) ? param : (m[key] ?? '').toString();
+    final url = pick(widget.baseUrl, 'baseUrl');
+    if (url.trim().isEmpty) throw 'Не заданы настройки подключения к 1С';
+    _od = _OData(url, pick(widget.username, 'username'), pick(widget.password, 'password'));
+    _checker = pick(widget.checkerName, 'checkerName');
   }
 
   /// Names, units and barcodes from 1C only for products missing in the cache.
@@ -691,7 +709,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
       final now = DateTime.now();
       String two(int v) => v.toString().padLeft(2, '0');
-      final log = StringBuffer('Проверено ТСД: ${widget.checkerName} '
+      final log = StringBuffer('Проверено ТСД: ${_checker.isEmpty ? 'ТСД' : _checker} '
           '${two(now.day)}.${two(now.month)} ${two(now.hour)}:${two(now.minute)}');
       if (rounded.isNotEmpty) log.write('; округлено: ${rounded.join(', ')}');
       if (shorts.isNotEmpty) log.write('; недостача: ${shorts.join(', ')}');
@@ -705,7 +723,11 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_prefsKey);
       _toast('Сохранено в 1С. Проведите документ в 1С.');
-      if (widget.onSaved != null) await widget.onSaved!();
+      if (widget.onSaved != null) {
+        await widget.onSaved!();
+      } else if (mounted) {
+        await Navigator.of(context).maybePop();
+      }
     } catch (e) {
       _alarm('$e');
     }
@@ -751,6 +773,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
             Text(_error!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.red)),
             const SizedBox(height: 12),
             FilledButton(onPressed: () => _load(force: true), child: const Text('Повторить')),
+            TextButton(onPressed: () => Navigator.of(context).maybePop(), child: const Text('Назад')),
           ]),
         ),
       );
@@ -766,9 +789,13 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       body = Column(children: [
         Container(
           width: double.infinity,
-          padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+          padding: const EdgeInsets.fromLTRB(0, 4, 4, 4),
           color: Theme.of(context).colorScheme.primaryContainer,
           child: Row(children: [
+            IconButton(
+                tooltip: 'Назад',
+                icon: const Icon(Icons.arrow_back),
+                onPressed: () => Navigator.of(context).maybePop()),
             Expanded(
               child: Text(
                 '№ ${_doc['Number'] ?? ''} · собрано $done из $inDoc'
@@ -851,6 +878,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
         ),
       ]);
     }
-    return SizedBox(width: widget.width, height: widget.height, child: body);
+    return SizedBox(width: widget.width, height: widget.height, child: SafeArea(child: body));
   }
 }
