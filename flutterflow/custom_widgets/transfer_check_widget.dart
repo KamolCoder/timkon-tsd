@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 // Begin custom widget code
 // DO NOT REMOVE OR MODIFY THE CODE ABOVE!
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
@@ -135,8 +136,14 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   final Map<String, double> _unitCoef = {};
 
   String _checker = '';
-  final StringBuffer _scanBuf = StringBuffer();
   bool _dialogOpen = false;
+
+  /// Scan field on top: always focused, so keyboard-wedge scanners that type
+  /// through the input method (not as key events) reach the app.
+  final TextEditingController _scanCtrl = TextEditingController();
+  final FocusNode _scanFocus = FocusNode();
+  Timer? _scanTimer;
+  bool _keyboard = false; // soft keyboard for manual input
   String _lastScan = '';
 
   /// true: every scan opens the quantity dialog; false: +1 / +block at once.
@@ -146,14 +153,26 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   @override
   void initState() {
     super.initState();
-    HardwareKeyboard.instance.addHandler(_onKey);
+    _scanFocus.addListener(() {
+      if (!_scanFocus.hasFocus) _refocus();
+    });
     _load();
   }
 
   @override
   void dispose() {
-    HardwareKeyboard.instance.removeHandler(_onKey);
+    _scanTimer?.cancel();
+    _scanCtrl.dispose();
+    _scanFocus.dispose();
     super.dispose();
+  }
+
+  /// Give the focus back to the scan field (after dialogs, taps on the list…).
+  void _refocus() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _dialogOpen || _loading || _error != null) return;
+      if (!_scanFocus.hasFocus) _scanFocus.requestFocus();
+    });
   }
 
   // ── loading (local only) ──
@@ -258,20 +277,31 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   // ── scanning ──
 
-  bool _onKey(KeyEvent e) {
-    if (_dialogOpen || _loading || _error != null || e is! KeyDownEvent) return false;
-    if (e.logicalKey == LogicalKeyboardKey.enter || e.logicalKey == LogicalKeyboardKey.numpadEnter) {
-      final code = _scanBuf.toString().trim();
-      _scanBuf.clear();
-      if (code.isNotEmpty) _onScan(code);
-      return true;
-    }
-    final ch = e.character;
-    if (ch != null && ch.isNotEmpty && ch.codeUnitAt(0) >= 32) {
-      _scanBuf.write(ch);
-      return true;
-    }
-    return false;
+  /// Enter from the scanner (suffix) or the keyboard.
+  void _submitScan() {
+    _scanTimer?.cancel();
+    final code = _scanCtrl.text.trim();
+    _scanCtrl.clear();
+    if (code.isNotEmpty) _onScan(code);
+    _refocus();
+  }
+
+  /// Scanners without an Enter suffix: accept the code 300 ms after the last char.
+  void _onScanChanged(String v) {
+    _scanTimer?.cancel();
+    if (_keyboard) return; // manual typing — wait for Enter
+    _scanTimer = Timer(const Duration(milliseconds: 300), () {
+      if (_scanCtrl.text.trim().length >= 6) _submitScan();
+    });
+  }
+
+  void _toggleKeyboard() {
+    setState(() => _keyboard = !_keyboard);
+    // the new keyboardType applies on the next focus
+    _scanFocus.unfocus();
+    Future.delayed(const Duration(milliseconds: 50), () {
+      if (mounted) _scanFocus.requestFocus();
+    });
   }
 
   Future<void> _onScan(String code) async {
@@ -383,6 +413,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       },
     );
     _dialogOpen = false;
+    _refocus();
     ctrl.dispose();
     return res;
   }
@@ -435,6 +466,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       ),
     );
     _dialogOpen = false;
+    _refocus();
     return res;
   }
 
@@ -459,6 +491,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       ),
     );
     _dialogOpen = false;
+    _refocus();
     return res == true;
   }
 
@@ -565,23 +598,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   int _rank(_St s) =>
       const [_St.foreign, _St.excess, _St.short, _St.pending, _St.ok].indexOf(s);
 
-  Future<void> _manualCode() async {
-    final ctrl = TextEditingController();
-    _dialogOpen = true;
-    final code = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Штрихкод'),
-        content: TextField(controller: ctrl, autofocus: true),
-        actions: [
-          FilledButton(onPressed: () => Navigator.pop(ctx, ctrl.text.trim()), child: const Text('OK')),
-        ],
-      ),
-    );
-    _dialogOpen = false;
-    if (code != null && code.isNotEmpty) await _onScan(code);
-  }
-
   @override
   Widget build(BuildContext context) {
     Widget body;
@@ -627,9 +643,33 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
                 tooltip: _askQty ? 'Скан спрашивает количество' : 'Скан сразу добавляет',
                 icon: Icon(_askQty ? Icons.pin : Icons.exposure_plus_1),
                 onPressed: _toggleAsk),
-            IconButton(tooltip: 'Ввести штрихкод', icon: const Icon(Icons.keyboard), onPressed: _manualCode),
             IconButton(tooltip: 'Сбросить проверку', icon: const Icon(Icons.restart_alt), onPressed: _reset),
           ]),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(8, 6, 8, 2),
+          child: TextField(
+            controller: _scanCtrl,
+            focusNode: _scanFocus,
+            autofocus: true,
+            showCursor: true,
+            keyboardType: _keyboard ? TextInputType.text : TextInputType.none,
+            textInputAction: TextInputAction.done,
+            onChanged: _onScanChanged,
+            onSubmitted: (_) => _submitScan(),
+            onEditingComplete: () {}, // keep the focus after Enter
+            decoration: InputDecoration(
+              isDense: true,
+              hintText: 'Сканируйте штрихкод…',
+              prefixIcon: const Icon(Icons.qr_code_scanner),
+              border: const OutlineInputBorder(),
+              suffixIcon: IconButton(
+                tooltip: _keyboard ? 'Скрыть клавиатуру' : 'Ввести вручную',
+                icon: Icon(_keyboard ? Icons.keyboard_hide : Icons.keyboard),
+                onPressed: _toggleKeyboard,
+              ),
+            ),
+          ),
         ),
         if (checked)
           Container(
