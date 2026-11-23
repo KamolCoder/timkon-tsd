@@ -8,12 +8,22 @@
 
 | Файл | Тип в FlutterFlow |
 |---|---|
-| `custom_actions/get_transfers_to_check.dart` | Custom Action `getTransfersToCheck` |
-| `custom_widgets/transfer_check_widget.dart` | Custom Widget `TransferCheckWidget` |
+| `custom_widgets/transfer_list_widget.dart` | Custom Widget `TransferListWidget` — список к проверке |
+| `custom_widgets/transfer_check_widget.dart` | Custom Widget `TransferCheckWidget` — экран проверки |
+| `custom_actions/get_transfers_to_check.dart` | Custom Action `getTransfersToCheck` — то же, что список, но JSON для своего ListView (не нужен, если используете `TransferListWidget`) |
 
 Зависимости: `http`, `shared_preferences` (в FlutterFlow: Custom Code → Dependencies, если ещё не добавлены).
 
-## 1. Custom Action `getTransfersToCheck`
+## 0. Custom Widget `TransferListWidget`
+
+Параметры: `baseUrl`, `username`, `password`, `warehouseKey` (String), `daysBack` (int, по умолчанию 7),
+`onOpen` — Action **с параметром `transferKey` (String)**: Navigate To «Проверка» с этим ключом.
+Размер: на весь экран.
+
+Поиск по номеру/магазину, обновление свайпом вниз и кнопкой. Жёлтым подсвечены документы,
+проверку которых начали на этом ТСД. После возврата со страницы проверки список обновляется сам.
+
+## 1. Custom Action `getTransfersToCheck` (необязательно)
 
 Аргументы: `baseUrl` (String), `username` (String), `password` (String), `warehouseKey` (String), `daysBack` (int).
 Return Type: **JSON, List**.
@@ -31,8 +41,9 @@ Return Type: **JSON, List**.
 
 ## 3. Страницы
 
-1. **Список**: On Page Load → `getTransfersToCheck` → ListView. Тап по строке → страница проверки с `key`.
-2. **Проверка**: только `TransferCheckWidget` с `transferKey`; `onSaved` → Navigate Back (список обновится на On Page Load).
+1. **Настройки**: поля → App State `baseUrl`, `username`, `password`, `warehouseKey`, `checkerName`.
+2. **Список**: только `TransferListWidget`; `onOpen(transferKey)` → Navigate To «Проверка» (параметр страницы `transferKey`).
+3. **Проверка**: только `TransferCheckWidget` с `transferKey`; `onSaved` → Navigate Back (список обновится сам).
 
 Адрес, логин, пароль и склад удобно держать в App State (persisted).
 `baseUrl` = `http://<IP сервера>/tbase` — по IP, не по имени `srv1`.
