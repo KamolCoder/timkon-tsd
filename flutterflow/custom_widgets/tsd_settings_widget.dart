@@ -184,7 +184,8 @@ class _TsdSettingsWidgetState extends State<TsdSettingsWidget> {
     return SizedBox(
       width: widget.width,
       height: widget.height,
-      child: SafeArea(
+      child: _EdgeSwipeBack(
+       child: SafeArea(
         child: Column(children: [
           Container(
             width: double.infinity,
@@ -254,6 +255,45 @@ class _TsdSettingsWidgetState extends State<TsdSettingsWidget> {
           ),
         ]),
       ),
+    ),
     );
+  }
+}
+
+/// Swipe from the left edge → back (Navigator.maybePop). Works on any Android,
+/// also on TSDs with button navigation where the system back gesture is absent.
+/// Taps and vertical scrolling pass through to the content.
+class _EdgeSwipeBack extends StatefulWidget {
+  const _EdgeSwipeBack({required this.child});
+  final Widget child;
+
+  @override
+  State<_EdgeSwipeBack> createState() => _EdgeSwipeBackState();
+}
+
+class _EdgeSwipeBackState extends State<_EdgeSwipeBack> {
+  double _dx = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(children: [
+      widget.child,
+      Positioned(
+        left: 0,
+        top: 0,
+        bottom: 0,
+        width: 28,
+        child: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onHorizontalDragStart: (_) => _dx = 0,
+          onHorizontalDragUpdate: (d) => _dx += d.delta.dx,
+          onHorizontalDragEnd: (d) {
+            if (_dx > 80 || (d.primaryVelocity ?? 0) > 400) {
+              Navigator.of(context).maybePop();
+            }
+          },
+        ),
+      ),
+    ]);
   }
 }

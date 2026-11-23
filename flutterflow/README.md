@@ -103,3 +103,9 @@ Custom Code → Configuration Files → `AndroidManifest.xml` → в `<applicati
 - `launcher_icon_1024.png` — Settings → App Assets → **Launcher Icon**;
 - `adaptive_foreground_1024.png` — Android **Adaptive Icon → Foreground** (прозрачный фон, рисунок в безопасной зоне);
 - Adaptive Icon → Background: цвет `#11796F`.
+
+## Назад
+
+На всех страницах работает свайп от левого края экрана → назад (свой жест в виджетах, работает и на ТСД
+с кнопочной навигацией), а также системный жест Android 10+ и кнопка «Назад».
+Прогресс проверки при уходе со страницы не теряется (хранится на ТСД).
