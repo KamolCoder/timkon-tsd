@@ -18,7 +18,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// Scanner: keyboard-wedge mode (code + Enter). A block barcode (unit with
 /// Коэффициент > 1) adds the whole block.
 /// Line rule: rounded = ceil(plan / k) * k; plan < fact <= rounded and
-/// fact % k == 0 is OK (rounded up to the block).
+/// fact % k == 0 is OK (rounded up to the block). Other excess is allowed
+/// after confirmation and listed in the comment («излишек»).
 /// «Готово» stores the result on the TSD (status «checked»); TransferListWidget
 /// sends it to 1C. Posting stays manual in 1C.
 class TransferCheckWidget extends StatefulWidget {
@@ -317,7 +318,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
     final st = _status(it, _blocks[it.productKey]);
     if (st == _St.foreign || st == _St.excess) {
-      _alarm(st == _St.foreign ? 'Нет в документе: ${it.name}' : 'Лишнее: ${it.name}');
+      _alarm(st == _St.foreign ? 'Нет в документе: ${it.name}' : 'Больше заказа: ${it.name}');
     } else {
       HapticFeedback.lightImpact();
     }
@@ -426,22 +427,29 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   // ── finish: result for 1C, stored on the TSD ──
 
   Future<void> _finish() async {
-    final blocking = _items.where((i) {
-      final s = _status(i, _blocks[i.productKey]);
-      return s == _St.excess || s == _St.askBlock || s == _St.foreign;
-    }).toList();
-    if (blocking.isNotEmpty) {
-      _alarm('Уберите лишнее / пересорт: ${blocking.map((i) => i.name).join(', ')}');
+    // Goods not in the document cannot be written into it (no line, price) — remove them.
+    final foreign = _items.where((i) => _status(i, _blocks[i.productKey]) == _St.foreign).toList();
+    if (foreign.isNotEmpty) {
+      _alarm('Нет в документе — уберите или поставьте 0: ${foreign.map((i) => i.name).join(', ')}');
       return;
     }
 
-    final rounded = <String>[], shorts = <String>[];
+    // Excess is allowed: 1C gets the actual quantity, the comment lists it.
+    final rounded = <String>[], shorts = <String>[], excess = <String>[];
     for (final i in _items.where((i) => i.inDoc)) {
       final s = _status(i, _blocks[i.productKey]);
-      if (s == _St.block) rounded.add('${i.name} ${_fmt(i.plan)}→${_fmt(i.fact)}');
-      if (s == _St.short || s == _St.pending) shorts.add('${i.name} ${_fmt(i.plan)}→${_fmt(i.fact)}');
+      final line = '${i.name} ${_fmt(i.plan)}→${_fmt(i.fact)}';
+      if (s == _St.block) rounded.add(line);
+      if (s == _St.short || s == _St.pending) shorts.add(line);
+      if (s == _St.excess || s == _St.askBlock) excess.add(line);
     }
-    if (shorts.isNotEmpty && !await _confirm('Завершить с недостачей?', shorts.join('\n'), 'Завершить')) return;
+    if (shorts.isNotEmpty || excess.isNotEmpty) {
+      final text = [
+        if (excess.isNotEmpty) 'Излишек (уйдёт в 1С фактом):\n${excess.join('\n')}',
+        if (shorts.isNotEmpty) 'Недостача:\n${shorts.join('\n')}',
+      ].join('\n\n');
+      if (!await _confirm('Есть расхождения', text, 'Завершить')) return;
+    }
 
     final rows = <Map<String, dynamic>>[];
     for (final it in _items.where((i) => i.inDoc)) {
@@ -472,6 +480,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     final log = StringBuffer('Проверено ТСД: ${_checker.isEmpty ? 'ТСД' : _checker} '
         '${two(now.day)}.${two(now.month)} ${two(now.hour)}:${two(now.minute)}');
     if (rounded.isNotEmpty) log.write('; округлено: ${rounded.join(', ')}');
+    if (excess.isNotEmpty) log.write('; излишек: ${excess.join(', ')}');
     if (shorts.isNotEmpty) log.write('; недостача: ${shorts.join(', ')}');
 
     await _saveProgress();
@@ -516,8 +525,8 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     _St.ok: 'совпало',
     _St.block: 'блок',
     _St.short: 'недостача',
-    _St.excess: 'лишнее',
-    _St.askBlock: 'больше заказа — блок?',
+    _St.excess: 'излишек',
+    _St.askBlock: 'излишек (если это блок — «Блок?»)',
     _St.foreign: 'нет в документе',
   };
 
