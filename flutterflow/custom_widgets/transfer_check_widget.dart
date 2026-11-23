@@ -108,6 +108,9 @@ class _OData {
       final msg = m['odata.error']?['message']?['value'];
       if (msg != null) return msg.toString();
     } catch (_) {}
+    // IIS / Apache HTML error page → just its title
+    final title = RegExp(r'<title>(.*?)</title>', dotAll: true).firstMatch(body)?.group(1);
+    if (title != null) return title.trim();
     return body.length > 300 ? body.substring(0, 300) : body;
   }
 
@@ -119,13 +122,29 @@ class _OData {
     return ((m['value'] as List?) ?? const []).cast<Map<String, dynamic>>();
   }
 
-  /// GET with an `or`-chain over many GUIDs, in chunks (URL length).
+  /// IIS rejects query strings over 2048 chars by default (HTTP 404.15), and
+  /// Cyrillic names grow ×6 when URL-encoded, so chunks are sized by the
+  /// encoded length of the whole query, not by a fixed number of keys.
+  static const _maxQuery = 1900;
+
+  /// GET with an `or`-chain over many GUIDs, in chunks that fit the URL limit.
   Future<List<Map<String, dynamic>>> getByKeys(
       String name, String field, Iterable<String> keys, String select) async {
     final all = keys.where((k) => k.isNotEmpty).toSet().toList();
     final out = <Map<String, dynamic>>[];
-    for (var i = 0; i < all.length; i += 15) {
-      final part = all.sublist(i, math.min(i + 15, all.length));
+    final fixed = Uri.encodeComponent(select).length + 60; // $format, $select, separators
+    var i = 0;
+    while (i < all.length) {
+      final part = <String>[];
+      var len = fixed;
+      while (i < all.length) {
+        final term = "${part.isEmpty ? '' : ' or '}$field eq guid'${all[i]}'";
+        final add = Uri.encodeComponent(term).length;
+        if (part.isNotEmpty && len + add > _maxQuery) break;
+        part.add(all[i]);
+        len += add;
+        i++;
+      }
       out.addAll(await getList(entity(name), {
         r'$filter': part.map((k) => "$field eq guid'$k'").join(' or '),
         r'$select': select,
