@@ -65,7 +65,8 @@ class TransferListWidget extends StatefulWidget {
 ///  tsd_docs            — JSON list of document keys on the TSD
 ///  tsd_doc_KEY         — {key, number, date, receiver, dataVersion, lines, status,
 ///                         progress, result, units, error, loadedAt}
-///                         status: new | work | checked | conflict
+///                         status: new | work | checked | conflict | sent
+///                         (sent: lines dropped, kept 7 days as history)
 ///  tsd_prod_PRODUCT    — {name, article, weight, base, units, codes, ts}
 class _Store {
   static const docsKey = 'tsd_docs';
@@ -126,8 +127,15 @@ class _Store {
     return p.setString('$prodPrefix$key', jsonEncode(e));
   }
 
-  /// Keep only products of documents still on the TSD; drop old-format keys.
+  /// Keep only products of documents still on the TSD; drop old-format keys
+  /// and sent documents older than 7 days.
   static Future<void> cleanup(SharedPreferences p) async {
+    final border = DateTime.now().subtract(const Duration(days: 7));
+    for (final d in docs(p)) {
+      if (d['status'] != 'sent') continue;
+      final at = DateTime.tryParse((d['sentAt'] ?? '').toString());
+      if (at == null || at.isBefore(border)) await removeDoc(p, d['key'].toString());
+    }
     final used = <String>{
       for (final d in docs(p))
         for (final l in (d['lines'] as List? ?? const [])) (l['Номенклатура_Key'] ?? '').toString(),
@@ -248,7 +256,9 @@ const _zeroGuid = '00000000-0000-0000-0000-000000000000';
 const _checkedMark = 'Проверено ТСД';
 
 class _TransferListWidgetState extends State<TransferListWidget> {
-  List<Map<String, dynamic>> _docs = [];
+  List<Map<String, dynamic>> _docs = []; // to check: new / work / checked / conflict
+  List<Map<String, dynamic>> _sent = []; // history
+  int _tab = 0;
   String _search = '';
   String? _busy; // text of the running operation
   String? _error;
@@ -271,6 +281,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
 
   Future<void> _init() async {
     await _readSettings();
+    await _Store.cleanup(await SharedPreferences.getInstance()); // history older than 7 days
     await _refreshLocal();
   }
 
@@ -294,9 +305,17 @@ class _TransferListWidgetState extends State<TransferListWidget> {
 
   Future<void> _refreshLocal() async {
     final prefs = await SharedPreferences.getInstance();
-    final docs = _Store.docs(prefs)
+    final all = _Store.docs(prefs);
+    final docs = all.where((d) => d['status'] != 'sent').toList()
       ..sort((a, b) => (b['date'] ?? '').toString().compareTo((a['date'] ?? '').toString()));
-    if (mounted) setState(() => _docs = docs);
+    final sent = all.where((d) => d['status'] == 'sent').toList()
+      ..sort((a, b) => (b['sentAt'] ?? '').toString().compareTo((a['sentAt'] ?? '').toString()));
+    if (mounted) {
+      setState(() {
+        _docs = docs;
+        _sent = sent;
+      });
+    }
   }
 
   void _toast(String msg, {bool error = false}) {
@@ -346,6 +365,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
         final checkedElsewhere = (m['Комментарий'] ?? '').toString().contains(_checkedMark);
         final local = _Store.doc(prefs, key);
         final status = (local?['status'] ?? '').toString();
+        if (status == 'sent') continue; // history, already in 1C
 
         if (checkedElsewhere) {
           if (local == null) continue;
@@ -383,6 +403,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
         final key = d['key'].toString();
         if (remoteKeys.contains(key)) continue;
         final status = (d['status'] ?? '').toString();
+        if (status == 'sent') continue;
         if (status == 'new') {
           await _Store.removeDoc(prefs, key);
           removed++;
@@ -426,7 +447,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
   Future<void> _loadProducts(SharedPreferences prefs, _OData od) async {
     final border = DateTime.now().subtract(const Duration(hours: 12)).millisecondsSinceEpoch;
     final keys = <String>{
-      for (final d in _Store.docs(prefs))
+      for (final d in _Store.docs(prefs).where((d) => d['status'] != 'sent'))
         for (final l in (d['lines'] as List? ?? const [])) (l['Номенклатура_Key'] ?? '').toString(),
     }..removeWhere((k) {
         if (k.isEmpty || k == _zeroGuid) return true;
@@ -534,7 +555,17 @@ class _TransferListWidgetState extends State<TransferListWidget> {
         'Товары': result['rows'],
         'Комментарий': old.isEmpty ? log : '$old\n$log',
       });
-      await _Store.removeDoc(prefs, key);
+      // Keep a light record for the «Отправленные» tab (no lines / goods).
+      await _Store.putDoc(prefs, {
+        'key': key,
+        'number': d['number'],
+        'date': d['date'],
+        'receiver': d['receiver'],
+        'status': 'sent',
+        'sentAt': DateTime.now().toIso8601String(),
+        'linesCount': (result['rows'] as List?)?.length ?? 0,
+        'log': log,
+      });
       return true;
     } on _ODataError catch (e) {
       if (e.status == 409) d['status'] = 'conflict';
@@ -579,6 +610,10 @@ class _TransferListWidgetState extends State<TransferListWidget> {
 
   Future<void> _open(Map<String, dynamic> d) async {
     final key = d['key'].toString();
+    if (d['status'] == 'sent') {
+      await _sentDialog(d);
+      return;
+    }
     if (d['status'] == 'conflict') {
       await _conflictDialog(d);
       return;
@@ -609,6 +644,28 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     await _refreshLocal();
   }
 
+  Future<void> _sentDialog(Map<String, dynamic> d) async {
+    final remove = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('№ ${d['number']} · ${d['receiver'] ?? ''}'),
+        content: SingleChildScrollView(
+          child: Text('Отправлено в 1С: ${_date((d['sentAt'] ?? '').toString())}\n'
+              'Строк: ${d['linesCount'] ?? 0}\n\n${(d['log'] ?? '').toString().replaceAll('; ', '\n')}\n\n'
+              'Документ не проведён — проведите его в 1С.'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Убрать из истории')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('OK')),
+        ],
+      ),
+    );
+    if (remove != true) return;
+    final prefs = await SharedPreferences.getInstance();
+    await _Store.removeDoc(prefs, d['key'].toString());
+    await _refreshLocal();
+  }
+
   Future<void> _openSettings() async {
     if (widget.onSettings == null) return;
     await widget.onSettings!();
@@ -623,6 +680,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     'work': 'в работе',
     'checked': 'проверен, ждёт отправки',
     'conflict': 'конфликт',
+    'sent': 'отправлен в 1С',
   };
 
   static const _statusColor = {
@@ -641,9 +699,10 @@ class _TransferListWidgetState extends State<TransferListWidget> {
   @override
   Widget build(BuildContext context) {
     final q = _search.trim().toLowerCase();
+    final source = _tab == 0 ? _docs : _sent;
     final visible = q.isEmpty
-        ? _docs
-        : _docs
+        ? source
+        : source
             .where((d) =>
                 d['number'].toString().toLowerCase().contains(q) ||
                 d['receiver'].toString().toLowerCase().contains(q))
@@ -652,7 +711,9 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     final busy = _busy != null;
 
     Widget list;
-    if (_docs.isEmpty) {
+    if (_tab == 1 && _sent.isEmpty) {
+      list = const Center(child: Text('Отправленных за 7 дней нет'));
+    } else if (_tab == 0 && _docs.isEmpty) {
       list = Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -675,8 +736,10 @@ class _TransferListWidgetState extends State<TransferListWidget> {
         itemBuilder: (ctx, i) {
           final d = visible[i];
           final status = (d['status'] ?? 'new').toString();
-          final lines = (d['lines'] as List?)?.length ?? 0;
-          final err = (d['error'] ?? '').toString();
+          final lines = (d['lines'] as List?)?.length ?? (d['linesCount'] as num?)?.toInt() ?? 0;
+          final err = status == 'sent'
+              ? _date((d['sentAt'] ?? '').toString())
+              : (d['error'] ?? '').toString();
           return Card(
             margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
             color: _statusColor[status],
@@ -688,7 +751,11 @@ class _TransferListWidgetState extends State<TransferListWidget> {
               subtitle: Text('№ ${d['number']} · ${_date(d['date'].toString())} · строк: $lines\n'
                   '${_statusText[status] ?? status}${err.isEmpty ? '' : ' · $err'}'),
               isThreeLine: true,
-              trailing: Icon(status == 'conflict' ? Icons.warning_amber : Icons.chevron_right),
+              trailing: Icon(status == 'conflict'
+                  ? Icons.warning_amber
+                  : status == 'sent'
+                      ? Icons.cloud_done
+                      : Icons.chevron_right),
             ),
           );
         },
@@ -753,7 +820,22 @@ class _TransferListWidgetState extends State<TransferListWidget> {
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
                 child: Text(_error!, style: const TextStyle(color: Colors.red)),
               ),
-            if (_docs.length > 5)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
+              child: SizedBox(
+                width: double.infinity,
+                child: SegmentedButton<int>(
+                  segments: [
+                    ButtonSegment(value: 0, label: Text('К проверке (${_docs.length})')),
+                    ButtonSegment(value: 1, label: Text('Отправленные (${_sent.length})')),
+                  ],
+                  selected: {_tab},
+                  showSelectedIcon: false,
+                  onSelectionChanged: (v) => setState(() => _tab = v.first),
+                ),
+              ),
+            ),
+            if (source.length > 5)
               Padding(
                 padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
                 child: TextField(

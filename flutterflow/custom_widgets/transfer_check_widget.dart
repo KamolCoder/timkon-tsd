@@ -156,6 +156,10 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   bool _dialogOpen = false;
   String _lastScan = '';
 
+  /// true: every scan opens the quantity dialog; false: +1 / +block at once.
+  /// Toggled in the header, stored on the TSD.
+  bool _askQty = true;
+
   @override
   void initState() {
     super.initState();
@@ -175,6 +179,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     try {
       final prefs = await SharedPreferences.getInstance();
       final settings = _Store.read(prefs, 'tsd_settings') ?? {};
+      _askQty = prefs.getBool('tsd_ask_qty') ?? true;
       _checker = (widget.checkerName?.isNotEmpty ?? false)
           ? widget.checkerName!
           : (settings['checkerName'] ?? '').toString();
@@ -293,37 +298,121 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   Future<void> _onScan(String code) async {
     _lastScan = code;
-    var hit = _barcodes[code] ?? (await _others())[code];
+    final hit = _barcodes[code] ?? (await _others())[code];
 
-    _Item? it;
-    double qty = 1;
+    // Resolve the line (not added to the list until a quantity is confirmed).
+    String key, productKey, charKey, name;
+    double step = 1;
     if (hit == null) {
-      // Unknown on the TSD: count it as a resort line by the barcode itself.
-      it = _byKey['?|$code'];
-      if (it == null) {
-        it = _Item('?', code, 'Неизвестный штрихкод $code', inDoc: false);
-        _items.add(it);
-        _byKey[it.key] = it;
-      }
+      productKey = '?';
+      charKey = code;
+      key = '?|$code';
+      name = 'Неизвестный штрихкод $code';
     } else {
-      qty = _unitCoef[hit[2]] ?? 1;
-      it = _byKey['${hit[0]}|${hit[1]}'];
-      if (it == null) {
-        it = _Item(hit[0], hit[1], _otherNames[hit[0]] ?? 'Товар не из документа', inDoc: false);
-        _items.add(it);
-        _byKey[it.key] = it;
-      }
+      productKey = hit[0];
+      charKey = hit[1];
+      key = '${hit[0]}|${hit[1]}';
+      step = _unitCoef[hit[2]] ?? 1;
+      name = _byKey[key]?.name ?? _otherNames[hit[0]] ?? 'Товар не из документа';
     }
-    it.fact += qty;
+    final existing = _byKey[key];
+    final inDoc = existing?.inDoc ?? false;
 
-    final st = _status(it, _blocks[it.productKey]);
-    if (st == _St.foreign || st == _St.excess) {
-      _alarm(st == _St.foreign ? 'Нет в документе: ${it.name}' : 'Больше заказа: ${it.name}');
-    } else {
-      HapticFeedback.lightImpact();
+    String? next; // a barcode scanned while the dialog was open
+    double qty = step;
+    if (_askQty) {
+      final r = await _qtyDialog(existing, name, inDoc, step);
+      if (r == null) return; // cancelled
+      qty = r.qty;
+      next = r.nextCode;
     }
-    setState(() {});
-    await _saveProgress();
+
+    if (qty > 0) {
+      var it = existing;
+      if (it == null) {
+        it = _Item(productKey, charKey, name, inDoc: false);
+        _items.add(it);
+        _byKey[it.key] = it;
+      }
+      it.fact += qty;
+      final st = _status(it, _blocks[it.productKey]);
+      if (st == _St.foreign || st == _St.excess) {
+        _alarm(st == _St.foreign ? 'Нет в документе: ${it.name}' : 'Больше заказа: ${it.name}');
+      } else {
+        HapticFeedback.lightImpact();
+      }
+      setState(() {});
+      await _saveProgress();
+    }
+    if (next != null) await _onScan(next);
+  }
+
+  /// Quantity for a scanned item. Enter confirms. If the scanner fires again
+  /// while the dialog is open, the new code replaces the selected text: the
+  /// current item gets the prefilled quantity and the new code is scanned next.
+  Future<_QtyResult?> _qtyDialog(_Item? it, String name, bool inDoc, double step) async {
+    final ctrl = TextEditingController(text: _fmt(step));
+    ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
+    _dialogOpen = true;
+    if (!inDoc) {
+      HapticFeedback.heavyImpact();
+      SystemSound.play(SystemSoundType.alert);
+    }
+
+    _QtyResult? parse(String raw) {
+      final t = raw.trim();
+      if (t.length >= 8 && RegExp(r'^\d+$').hasMatch(t)) return _QtyResult(step, t); // next barcode
+      final v = double.tryParse(t.replaceAll(',', '.'));
+      if (v == null || v < 0 || v > 99999) return null;
+      return _QtyResult(v, null);
+    }
+
+    final res = await showDialog<_QtyResult>(
+      context: context,
+      builder: (ctx) {
+        void submit() {
+          final r = parse(ctrl.text);
+          if (r != null) Navigator.pop(ctx, r);
+        }
+
+        return AlertDialog(
+          backgroundColor: inDoc ? null : const Color(0xFFFFEBEE),
+          title: Text(name, maxLines: 3, overflow: TextOverflow.ellipsis),
+          content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            if (!inDoc)
+              const Padding(
+                padding: EdgeInsets.only(bottom: 8),
+                child: Text('НЕТ В ДОКУМЕНТЕ', style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
+              ),
+            if (it != null && it.inDoc)
+              Text('План ${_fmt(it.plan)} · собрано ${_fmt(it.fact)}', style: const TextStyle(fontSize: 16)),
+            if (step > 1) Text('Штрихкод блока: ${_fmt(step)} шт'),
+            const SizedBox(height: 8),
+            TextField(
+              controller: ctrl,
+              autofocus: true,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+              decoration: const InputDecoration(labelText: 'Количество', border: OutlineInputBorder()),
+              onSubmitted: (_) => submit(),
+            ),
+          ]),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Отмена')),
+            FilledButton(onPressed: submit, child: const Text('Добавить')),
+          ],
+        );
+      },
+    );
+    _dialogOpen = false;
+    ctrl.dispose();
+    return res;
+  }
+
+  Future<void> _toggleAsk() async {
+    setState(() => _askQty = !_askQty);
+    (await SharedPreferences.getInstance()).setBool('tsd_ask_qty', _askQty);
+    _toast(_askQty ? 'Скан → спрашивать количество' : 'Скан → сразу +1 (блок — весь блок)');
   }
 
   void _alarm(String msg) {
@@ -591,6 +680,10 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
                 style: const TextStyle(fontWeight: FontWeight.w600),
               ),
             ),
+            IconButton(
+                tooltip: _askQty ? 'Скан спрашивает количество' : 'Скан сразу добавляет',
+                icon: Icon(_askQty ? Icons.pin : Icons.exposure_plus_1),
+                onPressed: _toggleAsk),
             IconButton(tooltip: 'Ввести штрихкод', icon: const Icon(Icons.keyboard), onPressed: _manualCode),
             IconButton(tooltip: 'Сбросить проверку', icon: const Icon(Icons.restart_alt), onPressed: _reset),
           ]),
@@ -636,10 +729,10 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
           child: SizedBox(
             width: double.infinity,
             height: 48,
-            child: FilledButton.icon(
-              onPressed: _finish,
-              icon: const Icon(Icons.check_circle),
-              label: const Text('Готово'),
+            child: _HoldButton(
+              label: 'Готово — удерживайте',
+              onConfirmed: _finish,
+              onTapHint: () => _toast('Чтобы завершить, удерживайте «Готово» 1,5 секунды'),
             ),
           ),
         ),
@@ -685,5 +778,78 @@ class _EdgeSwipeBackState extends State<_EdgeSwipeBack> {
         ),
       ),
     ]);
+  }
+}
+
+class _QtyResult {
+  _QtyResult(this.qty, this.nextCode);
+  final double qty;
+  final String? nextCode;
+}
+
+/// Button that fires only after being held for [hold] (protects «Готово»
+/// from an accidental touch). Fills while held; a short tap shows a hint.
+class _HoldButton extends StatefulWidget {
+  const _HoldButton({required this.label, required this.onConfirmed, this.onTapHint});
+  final String label;
+  final Future<void> Function() onConfirmed;
+  final VoidCallback? onTapHint;
+  static const hold = Duration(milliseconds: 1500);
+
+  @override
+  State<_HoldButton> createState() => _HoldButtonState();
+}
+
+class _HoldButtonState extends State<_HoldButton> with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(vsync: this, duration: _HoldButton.hold)
+    ..addStatusListener((s) async {
+      if (s == AnimationStatus.completed) {
+        HapticFeedback.mediumImpact();
+        _c.reset();
+        await widget.onConfirmed();
+      }
+    });
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return GestureDetector(
+      onTapDown: (_) => _c.forward(),
+      onTapUp: (_) {
+        if (_c.isAnimating) {
+          _c.reverse();
+          widget.onTapHint?.call();
+        }
+      },
+      onTapCancel: () => _c.reverse(),
+      child: AnimatedBuilder(
+        animation: _c,
+        builder: (ctx, _) => ClipRRect(
+          borderRadius: BorderRadius.circular(24),
+          child: Stack(fit: StackFit.expand, children: [
+            Container(color: scheme.primary.withAlpha(90)),
+            FractionallySizedBox(
+              alignment: Alignment.centerLeft,
+              widthFactor: _c.value,
+              child: Container(color: scheme.primary),
+            ),
+            Center(
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.check_circle, color: scheme.onPrimary),
+                const SizedBox(width: 8),
+                Text(widget.label,
+                    style: TextStyle(color: scheme.onPrimary, fontSize: 16, fontWeight: FontWeight.w600)),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
   }
 }
