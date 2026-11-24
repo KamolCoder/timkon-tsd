@@ -9,17 +9,27 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:http/http.dart' as http;
+import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sqflite/sqflite.dart';
 
 /// Offline-first list of transfers on the TSD.
 ///
-/// «Загрузить» downloads unposted «Перемещение товаров» of the warehouse with
-/// their lines + names/units/barcodes of the goods (stored on the TSD). The
-/// check itself (TransferCheckWidget) works without network. Checked documents
-/// are sent to 1C here: automatically after returning from the check page and
-/// with the «Отправить» button. A document changed / posted in 1C after the
-/// download is never overwritten (status «конфликт»).
+/// «Загрузить накладные» downloads today's «Перемещение товаров» of the
+/// warehouse (posted and unposted, not yet checked) with their lines + names /
+/// units / barcodes of the goods from 1C, then updates the goods catalog with
+/// photos from Stock API (SQLite) and pre-caches photos of today's goods.
+/// The check itself (TransferCheckWidget) works without network. Checked
+/// documents are sent to 1C here: automatically after the check and with
+/// «Отправить». A posted document is re-posted (Unpost → write → Post).
+///
+/// One-time check: a sent document gets «[ТСД✓]» in its 1C comment; such
+/// documents are never downloaded again and a send is refused if the mark
+/// appeared meanwhile (another TSD) or the document changed in 1C after the
+/// download («конфликт»). Sent keys are also kept on the TSD for 7 days.
+/// To re-check, remove the «[ТСД✓]» line from the comment in 1C.
 ///
 /// Settings come from TsdSettingsWidget (SharedPreferences `tsd_settings`);
 /// non-empty parameters override them.
@@ -32,7 +42,6 @@ class TransferListWidget extends StatefulWidget {
     this.username,
     this.password,
     this.warehouseKey,
-    this.daysBack,
     this.onOpen,
     this.onSettings,
   });
@@ -47,7 +56,6 @@ class TransferListWidget extends StatefulWidget {
 
   /// Ref_Key of the sender warehouse (Склад_Key)
   final String? warehouseKey;
-  final int? daysBack;
 
   /// Action with one String parameter: transferKey → navigate to the check page
   final Future Function(String transferKey)? onOpen;
@@ -63,11 +71,11 @@ class TransferListWidget extends StatefulWidget {
 
 /// SharedPreferences layout:
 ///  tsd_docs            — JSON list of document keys on the TSD
-///  tsd_doc_KEY         — {key, number, date, receiver, dataVersion, lines, status,
+///  tsd_doc_KEY         — {key, number, date, receiver, posted, dataVersion, lines, status,
 ///                         progress, result, error, loadedAt}
 ///                         status: new | work | checked | conflict | sent
 ///                         (sent: lines dropped, kept 7 days as history)
-///  tsd_prod_PRODUCT    — {name, article, weight, base, units, codes, ts}
+///  tsd_prod_PRODUCT    — {name, article, weight, base, units, codes, ts} (from 1C)
 class _Store {
   static const docsKey = 'tsd_docs';
   static const docPrefix = 'tsd_doc_';
@@ -127,8 +135,8 @@ class _Store {
     return p.setString('$prodPrefix$key', jsonEncode(e));
   }
 
-  /// Keep only products of documents still on the TSD; drop old-format keys
-  /// and sent documents older than 7 days.
+  /// Keep only 1C product data of documents still on the TSD; drop old-format
+  /// keys and sent documents older than 7 days.
   static Future<void> cleanup(SharedPreferences p) async {
     final border = DateTime.now().subtract(const Duration(days: 7));
     for (final d in docs(p)) {
@@ -145,6 +153,112 @@ class _Store {
       final unused = k.startsWith(prodPrefix) && !used.contains(k.substring(prodPrefix.length));
       if (legacy || unused) await p.remove(k);
     }
+  }
+}
+
+// ───────────────────────────── goods catalog (Stock API → SQLite) ─────────────────────────────
+
+class _Catalog {
+  static Database? _db;
+
+  static Future<Database> open() async {
+    if (_db != null) return _db!;
+    final path = p.join(await getDatabasesPath(), 'tsd_catalog.db');
+    return _db = await openDatabase(path, version: 1, onCreate: (db, v) async {
+      await db.execute('CREATE TABLE products (id TEXT PRIMARY KEY, name TEXT, article TEXT, unit TEXT, '
+          'thumb TEXT, image TEXT, active INTEGER)');
+      await db.execute('CREATE TABLE barcodes (code TEXT PRIMARY KEY, id TEXT)');
+      await db.execute('CREATE INDEX barcodes_id ON barcodes(id)');
+      await db.execute('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)');
+    });
+  }
+
+  static Future<int> count() async {
+    try {
+      final db = await open();
+      return Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM products')) ?? 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// First time — the whole catalog, then only changes (updated_since), pages of 1000.
+  /// Returns the number of received products.
+  static Future<int> sync(String base, String key, void Function(int) progress) async {
+    final db = await open();
+    final meta = await db.query('meta', where: 'k = ?', whereArgs: ['since']);
+    final since = meta.isEmpty ? null : meta.first['v'].toString();
+    final started = DateTime.now().toUtc().subtract(const Duration(minutes: 5)).toIso8601String();
+    var offset = 0, total = 0;
+    while (true) {
+      final params = {
+        'stocks': 'false',
+        'limit': '1000',
+        'offset': '$offset',
+        if (since != null) 'updated_since': since,
+      };
+      final q = params.entries.map((e) => '${e.key}=${Uri.encodeComponent(e.value)}').join('&');
+      http.Response r;
+      try {
+        r = await http.get(Uri.parse('$base/api/stock/products?$q'),
+            headers: {'X-API-Key': key, 'Accept': 'application/json'}).timeout(const Duration(seconds: 60));
+      } catch (e) {
+        throw 'Stock API: нет связи ($e)';
+      }
+      if (r.statusCode == 401 || r.statusCode == 403) throw 'Stock API: неверный ключ';
+      if (r.statusCode != 200) throw 'Stock API: HTTP ${r.statusCode}';
+      final items = ((jsonDecode(utf8.decode(r.bodyBytes))['items'] as List?) ?? const [])
+          .cast<Map<String, dynamic>>();
+      await db.transaction((tx) async {
+        final b = tx.batch();
+        for (final it in items) {
+          final id = (it['external_id'] ?? '').toString();
+          if (id.isEmpty) continue;
+          b.insert(
+              'products',
+              {
+                'id': id,
+                'name': (it['name'] ?? '').toString(),
+                'article': (it['article'] ?? '').toString(),
+                'unit': (it['unit'] ?? '').toString(),
+                'thumb': (it['thumb'] ?? '').toString(),
+                'image': (it['image'] ?? '').toString(),
+                'active': it['is_active'] == false ? 0 : 1,
+              },
+              conflictAlgorithm: ConflictAlgorithm.replace);
+          b.delete('barcodes', where: 'id = ?', whereArgs: [id]);
+          final codes = <String>{
+            ...((it['barcodes'] as List?) ?? const []).map((e) => e.toString()),
+            if ((it['barcode'] ?? '').toString().isNotEmpty) it['barcode'].toString(),
+          };
+          for (final c in codes) {
+            b.insert('barcodes', {'code': c, 'id': id}, conflictAlgorithm: ConflictAlgorithm.replace);
+          }
+        }
+        await b.commit(noResult: true);
+      });
+      total += items.length;
+      progress(total);
+      if (items.length < 1000) break;
+      offset += 1000;
+    }
+    await db.insert('meta', {'k': 'since', 'v': started}, conflictAlgorithm: ConflictAlgorithm.replace);
+    return total;
+  }
+
+  static Future<List<String>> thumbs(Iterable<String> ids) async {
+    final db = await open();
+    final all = ids.toSet().toList();
+    final out = <String>[];
+    for (var i = 0; i < all.length; i += 500) {
+      final part = all.sublist(i, i + 500 > all.length ? all.length : i + 500);
+      for (final r in await db.query('products',
+          columns: ['thumb'], where: 'id IN (${List.filled(part.length, '?').join(',')})', whereArgs: part)) {
+        final t = (r['thumb'] ?? '').toString();
+        if (t.isNotEmpty) out.add(t);
+      }
+    }
+    return out;
   }
 }
 
@@ -246,14 +360,23 @@ class _OData {
   Future<dynamic> patch(String path, Map<String, dynamic> body) =>
       _send(() => http.patch(_uri(path, const {}), headers: _headers, body: jsonEncode(body)));
 
-  Future<dynamic> post(String path, Map<String, dynamic> body) =>
-      _send(() => http.post(_uri(path, const {}), headers: _headers, body: jsonEncode(body)));
+  /// Bound action of a document: Post / Unpost (non-operational posting).
+  Future<dynamic> action(String docPath, String name) => _send(() => http.post(
+      _uri('$docPath/$name', const {'PostingModeOperational': 'false'}),
+      headers: _headers));
 }
 
 // ───────────────────────────── widget ─────────────────────────────
 
 const _zeroGuid = '00000000-0000-0000-0000-000000000000';
-const _checkedMark = 'Проверено ТСД';
+
+/// Mark of a document checked by a TSD (in Комментарий). «Проверено ТСД» is
+/// the mark of the earlier app version.
+const _mark = '[ТСД✓]';
+bool _hasMark(dynamic comment) {
+  final c = (comment ?? '').toString();
+  return c.contains(_mark) || c.contains('Проверено ТСД');
+}
 
 class _TransferListWidgetState extends State<TransferListWidget> {
   List<Map<String, dynamic>> _docs = []; // to check: new / work / checked / conflict
@@ -262,6 +385,9 @@ class _TransferListWidgetState extends State<TransferListWidget> {
   String _search = '';
   String? _busy; // text of the running operation
   String? _error;
+  String? _warning; // catalog problems: the 1C part still worked
+  String _lastLoad = '';
+  int _catalogCount = 0;
 
   // resolved settings
   String _root = '';
@@ -269,7 +395,8 @@ class _TransferListWidgetState extends State<TransferListWidget> {
   String _pass = '';
   String _warehouse = '';
   String _warehouseName = '';
-  int _days = 7;
+  String _stockUrl = '';
+  String _stockKey = '';
 
   bool get _noSettings => _root.isEmpty || _warehouse.isEmpty;
 
@@ -281,7 +408,10 @@ class _TransferListWidgetState extends State<TransferListWidget> {
 
   Future<void> _init() async {
     await _readSettings();
-    await _Store.cleanup(await SharedPreferences.getInstance()); // history older than 7 days
+    final prefs = await SharedPreferences.getInstance();
+    await _Store.cleanup(prefs); // history older than 7 days
+    _lastLoad = prefs.getString('tsd_last_load') ?? '';
+    _catalogCount = await _Catalog.count();
     await _refreshLocal();
   }
 
@@ -298,7 +428,8 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     _pass = (widget.password?.isNotEmpty ?? false) ? widget.password! : (m['password'] ?? '').toString();
     _warehouse = pick(widget.warehouseKey, 'warehouseKey');
     _warehouseName = (m['warehouseName'] ?? '').toString();
-    _days = widget.daysBack ?? (m['daysBack'] is num ? (m['daysBack'] as num).toInt() : 7);
+    _stockUrl = (m['stockUrl'] ?? '').toString().trim().replaceAll(RegExp(r'/+$'), '');
+    _stockKey = (m['stockKey'] ?? '').toString().trim();
   }
 
   _OData get _od => _OData(_root, _user, _pass);
@@ -338,35 +469,40 @@ class _TransferListWidgetState extends State<TransferListWidget> {
       return;
     }
     setState(() {
-      _busy = 'Загрузка накладных…';
+      _busy = 'Загрузка накладных из 1С…';
       _error = null;
+      _warning = null;
     });
+    String summary = '';
     try {
       final od = _od;
       final prefs = await SharedPreferences.getInstance();
-      final since = DateTime.now().subtract(Duration(days: _days < 0 ? 0 : _days));
+      // Today only (from 00:00), posted and unposted.
+      final now = DateTime.now();
       String two(int v) => v.toString().padLeft(2, '0');
-      final sinceStr = '${since.year}-${two(since.month)}-${two(since.day)}T00:00:00';
+      final sinceStr = '${now.year}-${two(now.month)}-${two(now.day)}T00:00:00';
 
       final remote = await od.getList(_OData.entity('Document_ПеремещениеТоваров'), {
-        r'$filter': "Склад_Key eq guid'$_warehouse' and Posted eq false "
-            "and DeletionMark eq false and Date ge datetime'$sinceStr'",
-        r'$select': 'Ref_Key,Number,Date,DataVersion,Комментарий,СкладПолучатель_Key,Товары',
+        r'$filter': "Склад_Key eq guid'$_warehouse' and DeletionMark eq false and Date ge datetime'$sinceStr'",
+        r'$select': 'Ref_Key,Number,Date,Posted,DataVersion,Комментарий,СкладПолучатель_Key,Товары',
         r'$orderby': 'Date desc',
       });
       final names =
           await _warehouseNames(prefs, od, remote.map((m) => (m['СкладПолучатель_Key'] ?? '').toString()).toSet());
 
-      var added = 0, updated = 0, removed = 0, conflicts = 0;
+      var added = 0, updated = 0, removed = 0, conflicts = 0, markLost = 0;
       final remoteKeys = <String>{};
       for (final m in remote) {
         final key = m['Ref_Key'].toString();
         remoteKeys.add(key);
-        final checkedElsewhere = (m['Комментарий'] ?? '').toString().contains(_checkedMark);
+        final checkedElsewhere = _hasMark(m['Комментарий']);
         final local = _Store.doc(prefs, key);
         final status = (local?['status'] ?? '').toString();
-        if (status == 'sent') continue; // history, already in 1C
-
+        if (status == 'sent') {
+          // Sent from this TSD: never again, even if the mark was erased in 1C.
+          if (!checkedElsewhere) markLost++;
+          continue;
+        }
         if (checkedElsewhere) {
           if (local == null) continue;
           if (status == 'new') {
@@ -374,13 +510,12 @@ class _TransferListWidgetState extends State<TransferListWidget> {
             removed++;
           } else if (status != 'conflict') {
             local['status'] = 'conflict';
-            local['error'] = 'Уже проверен на другом ТСД';
+            local['error'] = 'Уже проверен (отметка $_mark в 1С)';
             await _Store.putDoc(prefs, local);
             conflicts++;
           }
           continue;
         }
-
         final changed = local != null && local['dataVersion'] != m['DataVersion'];
         if (local == null) {
           await _Store.putDoc(prefs, _fromRemote(m, names));
@@ -398,7 +533,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
         }
       }
 
-      // Local documents no longer among the unposted ones in 1C.
+      // Local documents no longer among today's ones in 1C (deleted / date changed).
       for (final d in _Store.docs(prefs)) {
         final key = d['key'].toString();
         if (remoteKeys.contains(key)) continue;
@@ -409,23 +544,66 @@ class _TransferListWidgetState extends State<TransferListWidget> {
           removed++;
         } else if (status != 'conflict') {
           d['status'] = 'conflict';
-          d['error'] = 'Проведён, удалён или вне периода в 1С';
+          d['error'] = 'Удалён в 1С или дата не сегодня';
           await _Store.putDoc(prefs, d);
           conflicts++;
         }
       }
 
-      if (mounted) setState(() => _busy = 'Загрузка товаров…');
+      if (mounted) setState(() => _busy = 'Загрузка товаров из 1С…');
       await _loadProducts(prefs, od);
       await _Store.cleanup(prefs);
 
-      _toast('Загружено: новых $added, обновлено $updated, убрано $removed'
-          '${conflicts > 0 ? ', конфликтов $conflicts' : ''}');
+      summary = 'Новых $added, обновлено $updated, убрано $removed'
+          '${conflicts > 0 ? ', конфликтов $conflicts' : ''}';
+      if (markLost > 0) summary += '. У $markLost отправленных стёрта отметка $_mark в 1С';
+
+      await _syncCatalog(prefs);
+
+      _lastLoad = DateTime.now().toIso8601String();
+      await prefs.setString('tsd_last_load', _lastLoad);
+      _toast(summary);
     } catch (e) {
       _error = e.toString();
     }
     if (mounted) setState(() => _busy = null);
     await _refreshLocal();
+  }
+
+  /// Catalog with photos from Stock API + photos of today's goods into the cache.
+  /// Failures here do not break the 1C part (shown as a warning).
+  Future<void> _syncCatalog(SharedPreferences prefs) async {
+    if (_stockUrl.isEmpty || _stockKey.isEmpty) {
+      _warning = 'Каталог с фото не подключён: укажите Stock API в настройках';
+      return;
+    }
+    try {
+      if (mounted) setState(() => _busy = 'Каталог товаров…');
+      await _Catalog.sync(_stockUrl, _stockKey, (n) {
+        if (mounted) setState(() => _busy = 'Каталог товаров: $n…');
+      });
+      _catalogCount = await _Catalog.count();
+
+      final ids = <String>{
+        for (final d in _Store.docs(prefs).where((d) => d['status'] != 'sent'))
+          for (final l in (d['lines'] as List? ?? const [])) (l['Номенклатура_Key'] ?? '').toString(),
+      };
+      final thumbs = await _Catalog.thumbs(ids);
+      var n = 0;
+      for (var i = 0; i < thumbs.length && i < 600; i += 6) {
+        if (!mounted) return;
+        setState(() => _busy = 'Фото товаров: ${i + 1} из ${thumbs.length}');
+        await Future.wait(thumbs.skip(i).take(6).map((t) async {
+          try {
+            await precacheImage(CachedNetworkImageProvider('$_stockUrl$t'), context);
+            n++;
+          } catch (_) {}
+        }));
+      }
+      if (n < thumbs.length) _warning = 'Загружено фото: $n из ${thumbs.length}';
+    } catch (e) {
+      _warning = 'Каталог не обновлён: $e';
+    }
   }
 
   Map<String, dynamic> _fromRemote(Map<String, dynamic> m, Map<String, String> names) => {
@@ -434,6 +612,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
         'date': (m['Date'] ?? '').toString(),
         'receiver': names[(m['СкладПолучатель_Key'] ?? '').toString()] ?? '',
         'dataVersion': m['DataVersion'],
+        'posted': m['Posted'] == true,
         'lines': [
           for (final row in ((m['Товары'] as List?) ?? const []).cast<Map<String, dynamic>>())
             {for (final e in row.entries) if (!e.key.contains('@')) e.key: e.value},
@@ -442,7 +621,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
         'loadedAt': DateTime.now().toIso8601String(),
       };
 
-  /// Names, units and barcodes of all goods in the local documents
+  /// Names, units and barcodes (from 1C) of all goods in the local documents
   /// (missing ones or older than 12 h).
   Future<void> _loadProducts(SharedPreferences prefs, _OData od) async {
     final border = DateTime.now().subtract(const Duration(hours: 12)).millisecondsSinceEpoch;
@@ -457,9 +636,9 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     if (keys.isEmpty) return;
 
     final fresh = {
-      for (final p in keys)
-        p: <String, dynamic>{
-          'name': p.substring(0, 8),
+      for (final pk in keys)
+        pk: <String, dynamic>{
+          'name': pk.substring(0, 8),
           'article': '',
           'weight': false,
           'base': _zeroGuid,
@@ -467,14 +646,14 @@ class _TransferListWidgetState extends State<TransferListWidget> {
           'codes': <dynamic>[],
         }
     };
-    for (final p in await od.getByKeys('Catalog_Номенклатура', 'Ref_Key', keys,
+    for (final r in await od.getByKeys('Catalog_Номенклатура', 'Ref_Key', keys,
         'Ref_Key,Description,Артикул,Весовой,ЕдиницаИзмерения_Key')) {
-      final e = fresh[p['Ref_Key'].toString()];
+      final e = fresh[r['Ref_Key'].toString()];
       if (e == null) continue;
-      e['name'] = (p['Description'] ?? '').toString();
-      e['article'] = (p['Артикул'] ?? '').toString();
-      e['weight'] = p['Весовой'] == true;
-      e['base'] = (p['ЕдиницаИзмерения_Key'] ?? _zeroGuid).toString();
+      e['name'] = (r['Description'] ?? '').toString();
+      e['article'] = (r['Артикул'] ?? '').toString();
+      e['weight'] = r['Весовой'] == true;
+      e['base'] = (r['ЕдиницаИзмерения_Key'] ?? _zeroGuid).toString();
     }
     for (final u in await od.getByKeys('Catalog_ЕдиницыИзмерения', 'Owner_Key', keys,
         'Ref_Key,Owner_Key,Коэффициент,DeletionMark,ЕдиницаИзмеренияПоКлассификатору_Key')) {
@@ -521,34 +700,72 @@ class _TransferListWidgetState extends State<TransferListWidget> {
 
   // ── send ──
 
-  /// true = sent and removed from the TSD; false = 1C refused (status saved);
-  /// throws _ODataError(network: true) when there is no connection.
+  /// true = written to 1C (moved to «Отправленные»); false = 1C refused
+  /// (status saved); throws _ODataError(network: true) when there is no connection.
+  ///
+  /// Posted document: Unpost → write → Post. If posting fails the document
+  /// stays unposted with the new quantities (visible in 1C), never «posted
+  /// with old movements».
   Future<bool> _sendOne(SharedPreferences prefs, Map<String, dynamic> d) async {
     final key = d['key'].toString();
     final od = _od;
+    final path = _OData.entity('Document_ПеремещениеТоваров', key);
     try {
       Map<String, dynamic> fresh;
       try {
-        fresh = await od.getOne(_OData.entity('Document_ПеремещениеТоваров', key),
-            {r'$select': 'Posted,DeletionMark,DataVersion,Комментарий'});
+        fresh = await od.getOne(path, {r'$select': 'Posted,DeletionMark,DataVersion,Комментарий'});
       } on _ODataError catch (e) {
         if (e.status == 404) throw _ODataError('Документ удалён в 1С', status: 409);
         rethrow;
       }
-      if (fresh['Posted'] == true) throw _ODataError('Документ уже проведён в 1С', status: 409);
       if (fresh['DeletionMark'] == true) throw _ODataError('Документ помечен на удаление в 1С', status: 409);
+      if (_hasMark(fresh['Комментарий'])) {
+        throw _ODataError('Уже проверен (отметка $_mark в 1С) — повторная отправка запрещена', status: 409);
+      }
       if (fresh['DataVersion'] != d['dataVersion']) {
         throw _ODataError('Изменён в 1С после загрузки', status: 409);
       }
 
+      // repost: true when this TSD unposted it (now or in an interrupted earlier attempt)
+      var repost = d['repost'] == true;
+      if (fresh['Posted'] == true) {
+        await od.action(path, 'Unpost');
+        repost = true;
+        final v = await od.getOne(path, {r'$select': 'DataVersion'});
+        d['dataVersion'] = v['DataVersion'];
+        d['repost'] = true;
+        await _Store.putDoc(prefs, d);
+      }
+
       final result = d['result'] as Map<String, dynamic>;
+      var log = result['log'].toString();
+      if (!log.startsWith(_mark)) log = '$_mark $log';
       final old = (fresh['Комментарий'] ?? '').toString().trim();
-      final log = result['log'].toString();
-      await od.patch(_OData.entity('Document_ПеремещениеТоваров', key), {
-        'Товары': result['rows'],
-        'Комментарий': old.isEmpty ? log : '$old\n$log',
-      });
-      // Keep a light record for the «Отправленные» tab (no lines / goods).
+      try {
+        await od.patch(path, {
+          'Товары': result['rows'],
+          'Комментарий': old.isEmpty ? log : '$old\n$log',
+        });
+      } catch (e) {
+        if (repost && !(e is _ODataError && e.network)) {
+          try {
+            await od.action(path, 'Post'); // put the old version back as it was
+            d.remove('repost');
+          } catch (_) {}
+        }
+        rethrow;
+      }
+
+      String? postError;
+      if (repost) {
+        try {
+          await od.action(path, 'Post');
+        } on _ODataError catch (e) {
+          postError = e.message;
+        }
+      }
+
+      // Light record for «Отправленные» (no lines / goods); also guards against re-download.
       await _Store.putDoc(prefs, {
         'key': key,
         'number': d['number'],
@@ -558,6 +775,8 @@ class _TransferListWidgetState extends State<TransferListWidget> {
         'sentAt': DateTime.now().toIso8601String(),
         'linesCount': (result['rows'] as List?)?.length ?? 0,
         'log': log,
+        'reposted': repost && postError == null,
+        if (postError != null) 'postError': postError,
       });
       return true;
     } on _ODataError catch (e) {
@@ -590,12 +809,16 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     }
     if (mounted) setState(() => _busy = null);
     await _refreshLocal();
+    final notPosted = _sent.where((d) => d['postError'] != null && queue.any((q) => q['key'] == d['key'])).length;
     if (offline) {
       _toast('Нет связи с 1С — проверенные документы ждут отправки', error: true);
     } else if (failed > 0) {
       _toast('Отправлено $sent, не принято $failed (см. список)', error: true);
+    } else if (notPosted > 0) {
+      _toast('Отправлено $sent, но $notPosted не удалось провести — проведите в 1С (вкладка «Отправленные»)',
+          error: true);
     } else {
-      _toast('Отправлено в 1С: $sent. Проведите документы в 1С.');
+      _toast('Отправлено в 1С: $sent ✓');
     }
   }
 
@@ -622,9 +845,10 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     final remove = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.warning_amber, color: Colors.red, size: 40),
         title: Text('№ ${d['number']}: конфликт'),
-        content: Text('${d['error'] ?? ''}\n\nРезультат проверки с ТСД нельзя записать в 1С. '
-            'Удалите документ с ТСД и нажмите «Загрузить», чтобы получить актуальную версию.'),
+        content: Text('${d['error'] ?? ''}\n\nРезультат проверки нельзя записать в 1С. '
+            'Удалите документ с ТСД и нажмите «Загрузить накладные», чтобы получить актуальную версию.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Отмена')),
           FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Удалить с ТСД')),
@@ -638,14 +862,18 @@ class _TransferListWidgetState extends State<TransferListWidget> {
   }
 
   Future<void> _sentDialog(Map<String, dynamic> d) async {
+    final postError = d['postError'];
     final remove = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
+        icon: Icon(postError != null ? Icons.error_outline : Icons.cloud_done,
+            color: postError != null ? Colors.red : Colors.green, size: 40),
         title: Text('№ ${d['number']} · ${d['receiver'] ?? ''}'),
         content: SingleChildScrollView(
-          child: Text('Отправлено в 1С: ${_date((d['sentAt'] ?? '').toString())}\n'
+          child: Text('Отправлено в 1С: ${_time((d['sentAt'] ?? '').toString())}\n'
               'Строк: ${d['linesCount'] ?? 0}\n\n${(d['log'] ?? '').toString().replaceAll('; ', '\n')}\n\n'
-              'Документ не проведён — проведите его в 1С.'),
+              '${postError != null ? 'ВНИМАНИЕ: перепровести не удалось — $postError\n'
+                  'Документ не проведён, проведите его в 1С.' : d['reposted'] == true ? 'Документ перепроведён в 1С.' : 'Документ не проведён — проведите его в 1С.'}'),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Убрать из истории')),
@@ -663,36 +891,34 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     if (widget.onSettings == null) return;
     await widget.onSettings!();
     await _readSettings();
+    _catalogCount = await _Catalog.count();
     if (mounted) setState(() {});
   }
 
   // ── UI ──
 
-  static const _statusText = {
-    'new': 'новый',
-    'work': 'в работе',
-    'checked': 'проверен, ждёт отправки',
-    'conflict': 'конфликт',
-    'sent': 'отправлен в 1С',
+  static const _status = {
+    'new': ('Новый', Icons.fiber_new_outlined, Color(0xFF607D8B)),
+    'work': ('В работе', Icons.timelapse, Color(0xFFF9A825)),
+    'checked': ('Ждёт отправки', Icons.cloud_upload_outlined, Color(0xFF2E7D32)),
+    'conflict': ('Конфликт', Icons.warning_amber, Color(0xFFC62828)),
+    'sent': ('Отправлен', Icons.cloud_done, Color(0xFF2E7D32)),
   };
 
-  static const _statusColor = {
-    'work': Color(0xFFFFF59D),
-    'checked': Color(0xFFC8E6C9),
-    'conflict': Color(0xFFFFCDD2),
-  };
-
-  String _date(String s) {
+  String _time(String s) {
     final d = DateTime.tryParse(s);
     if (d == null) return '';
     String two(int v) => v.toString().padLeft(2, '0');
-    return '${two(d.day)}.${two(d.month)} ${two(d.hour)}:${two(d.minute)}';
+    final today = DateTime.now();
+    final sameDay = d.year == today.year && d.month == today.month && d.day == today.day;
+    return sameDay ? '${two(d.hour)}:${two(d.minute)}' : '${two(d.day)}.${two(d.month)} ${two(d.hour)}:${two(d.minute)}';
   }
 
   @override
   Widget build(BuildContext context) {
-    final q = _search.trim().toLowerCase();
+    final scheme = Theme.of(context).colorScheme;
     final source = _tab == 0 ? _docs : _sent;
+    final q = _search.trim().toLowerCase();
     final visible = q.isEmpty
         ? source
         : source
@@ -705,53 +931,21 @@ class _TransferListWidgetState extends State<TransferListWidget> {
 
     Widget list;
     if (_tab == 1 && _sent.isEmpty) {
-      list = const Center(child: Text('Отправленных за 7 дней нет'));
+      list = _empty(Icons.cloud_done_outlined, 'Отправленных за 7 дней нет');
     } else if (_tab == 0 && _docs.isEmpty) {
-      list = Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Text(
-              _noSettings ? 'Укажите в настройках адрес 1С и склад' : 'На ТСД нет накладных.\nНажмите «Загрузить».',
-              textAlign: TextAlign.center,
-            ),
-            if (_noSettings && widget.onSettings != null) ...[
-              const SizedBox(height: 12),
-              FilledButton.icon(
-                  onPressed: _openSettings, icon: const Icon(Icons.settings), label: const Text('Настройки')),
-            ],
-          ]),
-        ),
-      );
+      list = _noSettings
+          ? Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+              _empty(Icons.settings_outlined, 'Сначала укажите адрес 1С и склад'),
+              if (widget.onSettings != null)
+                FilledButton.icon(
+                    onPressed: _openSettings, icon: const Icon(Icons.settings), label: const Text('Настройки')),
+            ])
+          : _empty(Icons.inventory_2_outlined, 'Накладных на сегодня нет.\nНажмите «Загрузить накладные».');
     } else {
       list = ListView.builder(
+        padding: const EdgeInsets.only(bottom: 12),
         itemCount: visible.length,
-        itemBuilder: (ctx, i) {
-          final d = visible[i];
-          final status = (d['status'] ?? 'new').toString();
-          final lines = (d['lines'] as List?)?.length ?? (d['linesCount'] as num?)?.toInt() ?? 0;
-          final err = status == 'sent'
-              ? _date((d['sentAt'] ?? '').toString())
-              : (d['error'] ?? '').toString();
-          return Card(
-            margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-            color: _statusColor[status],
-            child: ListTile(
-              onTap: busy ? null : () => _open(d),
-              title: Text(
-                  (d['receiver'] ?? '').toString().isEmpty ? '№ ${d['number']}' : d['receiver'].toString(),
-                  style: const TextStyle(fontWeight: FontWeight.w600)),
-              subtitle: Text('№ ${d['number']} · ${_date(d['date'].toString())} · строк: $lines\n'
-                  '${_statusText[status] ?? status}${err.isEmpty ? '' : ' · $err'}'),
-              isThreeLine: true,
-              trailing: Icon(status == 'conflict'
-                  ? Icons.warning_amber
-                  : status == 'sent'
-                      ? Icons.cloud_done
-                      : Icons.chevron_right),
-            ),
-          );
-        },
+        itemBuilder: (ctx, i) => _card(visible[i], busy),
       );
     }
 
@@ -761,66 +955,84 @@ class _TransferListWidgetState extends State<TransferListWidget> {
       child: _EdgeSwipeBack(
         child: SafeArea(
           child: Column(children: [
+            // ── header ──
             Container(
               width: double.infinity,
-              color: Theme.of(context).colorScheme.primaryContainer,
-              padding: const EdgeInsets.only(left: 12),
+              color: scheme.primaryContainer,
+              padding: const EdgeInsets.fromLTRB(16, 10, 4, 10),
               child: Row(children: [
                 Expanded(
-                  child: Text(
-                    _warehouseName.isEmpty ? 'Перемещения' : 'Перемещения · $_warehouseName',
-                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-                    overflow: TextOverflow.ellipsis,
-                  ),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const Text('Перемещения', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
+                    Text(
+                      [
+                        if (_warehouseName.isNotEmpty) _warehouseName,
+                        'сегодня',
+                      ].join(' · '),
+                      style: const TextStyle(fontSize: 13, color: Colors.black54),
+                    ),
+                  ]),
                 ),
                 if (widget.onSettings != null)
                   IconButton(
-                      tooltip: 'Настройки',
-                      icon: const Icon(Icons.settings),
-                      onPressed: busy ? null : _openSettings),
+                      tooltip: 'Настройки', icon: const Icon(Icons.settings), onPressed: busy ? null : _openSettings),
               ]),
             ),
+            // ── main action ──
             Padding(
-              padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
-              child: Row(children: [
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: busy ? null : _download,
-                    icon: const Icon(Icons.cloud_download),
-                    label: const Text('Загрузить'),
-                  ),
+              padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+              child: SizedBox(
+                width: double.infinity,
+                height: 54,
+                child: FilledButton.icon(
+                  onPressed: busy ? null : _download,
+                  icon: const Icon(Icons.cloud_download, size: 26),
+                  label: const Text('Загрузить накладные', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
                 ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: FilledButton.tonalIcon(
-                    onPressed: busy || toSend == 0 ? null : () => _sendAll(),
-                    icon: const Icon(Icons.cloud_upload),
-                    label: Text('Отправить ($toSend)'),
-                  ),
-                ),
-              ]),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Text(
+                [
+                  _lastLoad.isEmpty ? 'Ещё не загружали' : 'Загружено ${_time(_lastLoad)}',
+                  if (_catalogCount > 0) 'каталог $_catalogCount',
+                ].join(' · '),
+                style: const TextStyle(fontSize: 12, color: Colors.black54),
+              ),
             ),
             if (busy)
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
                 child: Column(children: [
                   const LinearProgressIndicator(),
                   Padding(padding: const EdgeInsets.all(4), child: Text(_busy!)),
                 ]),
               ),
-            if (_error != null)
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                child: Text(_error!, style: const TextStyle(color: Colors.red)),
+            if (_error != null) _banner(_error!, Colors.red.shade50, Colors.red.shade800, Icons.error_outline),
+            if (_warning != null && _error == null)
+              _banner(_warning!, Colors.orange.shade50, Colors.orange.shade900, Icons.info_outline),
+            if (toSend > 0 && !busy)
+              Container(
+                margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
+                decoration: BoxDecoration(color: const Color(0xFFE8F5E9), borderRadius: BorderRadius.circular(12)),
+                child: Row(children: [
+                  const Icon(Icons.cloud_upload_outlined, color: Color(0xFF2E7D32)),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text('Проверено и не отправлено: $toSend')),
+                  FilledButton(onPressed: () => _sendAll(), child: const Text('Отправить')),
+                ]),
               ),
+            // ── tabs ──
             Padding(
-              padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
               child: SizedBox(
                 width: double.infinity,
                 child: SegmentedButton<int>(
                   segments: [
-                    ButtonSegment(value: 0, label: Text('К проверке (${_docs.length})')),
-                    ButtonSegment(value: 1, label: Text('Отправленные (${_sent.length})')),
+                    ButtonSegment(value: 0, label: Text('К проверке ${_docs.length}')),
+                    ButtonSegment(value: 1, label: Text('Отправленные ${_sent.length}')),
                   ],
                   selected: {_tab},
                   showSelectedIcon: false,
@@ -828,15 +1040,15 @@ class _TransferListWidgetState extends State<TransferListWidget> {
                 ),
               ),
             ),
-            if (source.length > 5)
+            if (source.length > 6)
               Padding(
-                padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
+                padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
                 child: TextField(
-                  decoration: const InputDecoration(
+                  decoration: InputDecoration(
                     isDense: true,
-                    prefixIcon: Icon(Icons.search),
+                    prefixIcon: const Icon(Icons.search),
                     hintText: 'Номер или магазин',
-                    border: OutlineInputBorder(),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                   ),
                   onChanged: (v) => setState(() => _search = v),
                 ),
@@ -847,11 +1059,91 @@ class _TransferListWidgetState extends State<TransferListWidget> {
       ),
     );
   }
+
+  Widget _empty(IconData icon, String text) => Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Icon(icon, size: 56, color: Colors.black26),
+            const SizedBox(height: 10),
+            Text(text, textAlign: TextAlign.center, style: const TextStyle(fontSize: 16, color: Colors.black54)),
+          ]),
+        ),
+      );
+
+  Widget _banner(String text, Color bg, Color fg, IconData icon) => Container(
+        width: double.infinity,
+        margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(12)),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Icon(icon, color: fg, size: 20),
+          const SizedBox(width: 8),
+          Expanded(child: Text(text, style: TextStyle(color: fg))),
+        ]),
+      );
+
+  Widget _card(Map<String, dynamic> d, bool busy) {
+    final status = (d['status'] ?? 'new').toString();
+    final failedPost = d['postError'] != null;
+    final s = _status[status] ?? _status['new']!;
+    final color = failedPost ? const Color(0xFFC62828) : s.$3;
+    final lines = (d['lines'] as List?)?.length ?? (d['linesCount'] as num?)?.toInt() ?? 0;
+    final sub = status == 'sent'
+        ? 'отправлен ${_time((d['sentAt'] ?? '').toString())}${failedPost ? ' · НЕ ПРОВЕДЁН' : ''}'
+        : (d['error'] ?? '').toString();
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      child: InkWell(
+        onTap: busy ? null : () => _open(d),
+        child: IntrinsicHeight(
+          child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Container(width: 6, color: color),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(
+                    (d['receiver'] ?? '').toString().isEmpty ? '№ ${d['number']}' : d['receiver'].toString(),
+                    style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    '№ ${d['number']} · ${_time(d['date'].toString())} · строк $lines'
+                    '${d['posted'] == true ? ' · проведён' : ''}',
+                    style: const TextStyle(fontSize: 13, color: Colors.black54),
+                  ),
+                  const SizedBox(height: 6),
+                  Row(children: [
+                    Icon(failedPost ? Icons.error_outline : s.$2, size: 16, color: color),
+                    const SizedBox(width: 4),
+                    Text(failedPost ? 'Не проведён' : s.$1,
+                        style: TextStyle(fontSize: 13, color: color, fontWeight: FontWeight.w600)),
+                    if (sub.isNotEmpty) ...[
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text('· $sub',
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontSize: 12, color: Colors.black54)),
+                      ),
+                    ],
+                  ]),
+                ]),
+              ),
+            ),
+            const Padding(padding: EdgeInsets.only(right: 8), child: Icon(Icons.chevron_right)),
+          ]),
+        ),
+      ),
+    );
+  }
 }
 
 /// Swipe from the left edge → back (Navigator.maybePop). Works on any Android,
 /// also on TSDs with button navigation where the system back gesture is absent.
-/// Taps and vertical scrolling pass through to the content.
 class _EdgeSwipeBack extends StatefulWidget {
   const _EdgeSwipeBack({required this.child});
   final Widget child;

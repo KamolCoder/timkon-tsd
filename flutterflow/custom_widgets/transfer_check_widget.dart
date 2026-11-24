@@ -10,18 +10,21 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/services.dart';
+import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sqflite/sqflite.dart';
 
 /// Offline check of one «Перемещение товаров» downloaded by TransferListWidget.
-/// No network here: the document, names, units and barcodes are on the TSD.
+/// No network for the check itself: document, names, units and barcodes are on
+/// the TSD; the goods catalog with photos (Stock API) is in SQLite.
 ///
-/// Scanner: keyboard-wedge mode (code + Enter). A barcode of a 1C unit with
-/// Коэффициент > 1 (package) prefills that quantity.
-/// Line rule: fact = plan → OK, less → shortage, more → excess. Excess is allowed
-/// after confirmation and listed in the comment («излишек»).
-/// «Готово» stores the result on the TSD (status «checked»); TransferListWidget
-/// sends it to 1C. Posting stays manual in 1C.
+/// Scan → quantity dialog (prefilled 1, or the package quantity for a package
+/// barcode). fact = plan → OK, less → shortage, more → excess (allowed after
+/// confirmation, listed in the comment). Goods not in the document block
+/// «Готово». «Готово» is a hold-to-confirm button; the result is stored on the
+/// TSD and TransferListWidget sends it to 1C.
 class TransferCheckWidget extends StatefulWidget {
   const TransferCheckWidget({
     super.key,
@@ -72,6 +75,51 @@ class _Store {
   static Map<String, dynamic>? prod(SharedPreferences p, String key) => read(p, '$prodPrefix$key');
 }
 
+/// Goods catalog from Stock API (filled by TransferListWidget), read-only here.
+class _Catalog {
+  static Database? _db;
+
+  static Future<Database?> open() async {
+    if (_db != null) return _db;
+    try {
+      final path = p.join(await getDatabasesPath(), 'tsd_catalog.db');
+      if (!await databaseExists(path)) return null;
+      return _db = await openDatabase(path); // same instance as the list widget (read-write)
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// barcode → {id, name, article, unit, thumb, image}
+  static Future<Map<String, dynamic>?> byBarcode(String code) async {
+    final db = await open();
+    if (db == null) return null;
+    final r = await db.rawQuery(
+        'SELECT p.* FROM barcodes b JOIN products p ON p.id = b.id WHERE b.code = ? LIMIT 1', [code]);
+    return r.isEmpty ? null : Map<String, dynamic>.from(r.first);
+  }
+
+  static Future<Map<String, Map<String, dynamic>>> byIds(Iterable<String> ids) async {
+    final db = await open();
+    final out = <String, Map<String, dynamic>>{};
+    if (db == null) return out;
+    final all = ids.toSet().toList();
+    for (var i = 0; i < all.length; i += 500) {
+      final part = all.sublist(i, math.min(i + 500, all.length));
+      for (final r in await db.query('products', where: 'id IN (${List.filled(part.length, '?').join(',')})', whereArgs: part)) {
+        out[r['id'].toString()] = Map<String, dynamic>.from(r);
+      }
+    }
+    return out;
+  }
+
+  static Future<String> base() async {
+    final prefs = await SharedPreferences.getInstance();
+    final s = _Store.read(prefs, 'tsd_settings') ?? {};
+    return (s['stockUrl'] ?? '').toString().trim().replaceAll(RegExp(r'/+$'), '');
+  }
+}
+
 // ───────────────────────────── model ─────────────────────────────
 
 const _zeroGuid = '00000000-0000-0000-0000-000000000000';
@@ -91,6 +139,8 @@ class _Item {
   final String charKey;
   String name;
   String article = '';
+  String thumb = '';
+  String image = '';
   bool weight = false;
   final bool inDoc;
   final List<_DocLine> lines = [];
@@ -107,7 +157,6 @@ String _fmt(double v) {
   return r == r.roundToDouble() ? r.toInt().toString() : r.toString();
 }
 
-/// fact vs plan.
 _St _status(_Item it) {
   final plan = it.plan, fact = it.fact;
   if (!it.inDoc) return fact > 0 ? _St.foreign : _St.pending;
@@ -115,6 +164,32 @@ _St _status(_Item it) {
   if ((fact - plan).abs() < 1e-6) return _St.ok;
   return fact < plan ? _St.short : _St.excess;
 }
+
+const _stColor = {
+  _St.pending: Color(0xFF9E9E9E),
+  _St.ok: Color(0xFF2E7D32),
+  _St.short: Color(0xFFF9A825),
+  _St.excess: Color(0xFFC62828),
+  _St.foreign: Color(0xFFC62828),
+};
+
+const _stBg = {
+  _St.pending: Colors.white,
+  _St.ok: Color(0xFFE8F5E9),
+  _St.short: Color(0xFFFFF8E1),
+  _St.excess: Color(0xFFFFEBEE),
+  _St.foreign: Color(0xFFFFEBEE),
+};
+
+const _stLabel = {
+  _St.pending: 'не собрано',
+  _St.ok: 'совпало',
+  _St.short: 'недостача',
+  _St.excess: 'излишек',
+  _St.foreign: 'нет в документе',
+};
+
+enum _Filter { all, left, issues }
 
 // ───────────────────────────── state ─────────────────────────────
 
@@ -126,17 +201,19 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   final List<_Item> _items = [];
   final Map<String, _Item> _byKey = {};
 
-  /// barcode → (productKey, charKey, unitKey); goods of this document
+  /// barcode → (productKey, charKey, unitKey); goods of this document (from 1C)
   final Map<String, List<String>> _barcodes = {};
 
-  /// barcodes / names of goods of all documents on the TSD (to name a resort)
+  /// barcodes / names of goods of the other downloaded documents
   Map<String, List<String>>? _otherCodes;
   final Map<String, String> _otherNames = {};
 
   final Map<String, double> _unitCoef = {};
+  String _stockBase = '';
 
   String _checker = '';
   bool _dialogOpen = false;
+  _Filter _filter = _Filter.all;
 
   /// Scan field on top: always focused, so keyboard-wedge scanners that type
   /// through the input method (not as key events) reach the app.
@@ -146,8 +223,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   bool _keyboard = false; // soft keyboard for manual input
   String _lastScan = '';
 
-  /// true: every scan opens the quantity dialog; false: +1 / +block at once.
-  /// Toggled in the header, stored on the TSD.
+  /// true: every scan opens the quantity dialog; false: added at once.
   bool _askQty = true;
 
   @override
@@ -167,13 +243,14 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     super.dispose();
   }
 
-  /// Give the focus back to the scan field (after dialogs, taps on the list…).
   void _refocus() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || _dialogOpen || _loading || _error != null) return;
       if (!_scanFocus.hasFocus) _scanFocus.requestFocus();
     });
   }
+
+  String _url(String path) => path.isEmpty || _stockBase.isEmpty ? '' : '$_stockBase$path';
 
   // ── loading (local only) ──
 
@@ -185,25 +262,36 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       _checker = (widget.checkerName?.isNotEmpty ?? false)
           ? widget.checkerName!
           : (settings['checkerName'] ?? '').toString();
+      _stockBase = await _Catalog.base();
 
       final doc = _Store.doc(prefs, widget.transferKey);
-      if (doc == null) throw 'Документа нет на ТСД. Нажмите «Загрузить» в списке.';
+      if (doc == null) throw 'Документа нет на ТСД.\nНажмите «Загрузить» на списке.';
       if (doc['status'] == 'conflict') throw 'Конфликт: ${doc['error'] ?? ''}';
       _doc = doc;
 
       for (final row in ((doc['lines'] as List?) ?? const []).cast<Map<String, dynamic>>()) {
-        final p = (row['Номенклатура_Key'] ?? _zeroGuid).toString();
+        final pk = (row['Номенклатура_Key'] ?? _zeroGuid).toString();
         final c = (row['ХарактеристикаНоменклатуры_Key'] ?? _zeroGuid).toString();
-        final it = _byKey.putIfAbsent('$p|$c', () {
-          final n = _Item(p, c, p.length >= 8 ? p.substring(0, 8) : p);
+        final it = _byKey.putIfAbsent('$pk|$c', () {
+          final n = _Item(pk, c, pk.length >= 8 ? pk.substring(0, 8) : pk);
           _items.add(n);
           return n;
         });
         it.lines.add(_DocLine(row));
       }
-      for (final p in _items.map((e) => e.productKey).toSet()) {
-        final e = _Store.prod(prefs, p);
-        if (e != null) _apply(p, e);
+      final keys = _items.map((e) => e.productKey).toSet();
+      for (final pk in keys) {
+        final e = _Store.prod(prefs, pk);
+        if (e != null) _apply(pk, e);
+      }
+      // photos (and names, if 1C data is missing) from the catalog
+      final cat = await _Catalog.byIds(keys);
+      for (final it in _items) {
+        final c = cat[it.productKey];
+        if (c == null) continue;
+        it.thumb = (c['thumb'] ?? '').toString();
+        it.image = (c['image'] ?? '').toString();
+        if (it.name.length <= 8) it.name = (c['name'] ?? it.name).toString();
       }
       _restoreProgress();
     } catch (e) {
@@ -219,16 +307,14 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       it.weight = e['weight'] == true;
     }
     for (final u in (e['units'] as List? ?? const [])) {
-      final ref = u[0].toString();
       final coef = _num(u[1]);
-      _unitCoef[ref] = coef <= 0 ? 1 : coef;
+      _unitCoef[u[0].toString()] = coef <= 0 ? 1 : coef;
     }
     for (final c in (e['codes'] as List? ?? const [])) {
       _barcodes[c[0].toString()] = [productKey, c[1].toString(), c[2].toString()];
     }
   }
 
-  /// Barcodes of goods of the other downloaded documents (built on first need).
   Future<Map<String, List<String>>> _others() async {
     if (_otherCodes != null) return _otherCodes!;
     final prefs = await SharedPreferences.getInstance();
@@ -236,13 +322,13 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     for (final k in prefs.getKeys().where((k) => k.startsWith(_Store.prodPrefix))) {
       final e = _Store.read(prefs, k);
       if (e == null) continue;
-      final p = k.substring(_Store.prodPrefix.length);
-      _otherNames[p] = (e['name'] ?? '').toString();
+      final pk = k.substring(_Store.prodPrefix.length);
+      _otherNames[pk] = (e['name'] ?? '').toString();
       for (final u in (e['units'] as List? ?? const [])) {
         _unitCoef.putIfAbsent(u[0].toString(), () => math.max(1.0, _num(u[1])));
       }
       for (final c in (e['codes'] as List? ?? const [])) {
-        map[c[0].toString()] = [p, c[1].toString(), c[2].toString()];
+        map[c[0].toString()] = [pk, c[1].toString(), c[2].toString()];
       }
     }
     return _otherCodes = map;
@@ -254,7 +340,9 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     final m = _doc['progress'] as Map<String, dynamic>?;
     if (m == null) return;
     for (final f in ((m['foreign'] as List?) ?? const [])) {
-      final it = _Item(f['p'], f['c'], f['n'], inDoc: false)..fact = _num(f['f']);
+      final it = _Item(f['p'], f['c'], f['n'], inDoc: false)
+        ..fact = _num(f['f'])
+        ..thumb = (f['t'] ?? '').toString();
       _items.add(it);
       _byKey[it.key] = it;
     }
@@ -265,11 +353,11 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     _doc['progress'] = {
       'facts': {for (final i in _items) if (i.fact != 0) i.key: i.fact},
       'foreign': [
-        for (final i in _items.where((i) => !i.inDoc)) {'p': i.productKey, 'c': i.charKey, 'n': i.name, 'f': i.fact}
+        for (final i in _items.where((i) => !i.inDoc))
+          {'p': i.productKey, 'c': i.charKey, 'n': i.name, 'f': i.fact, 't': i.thumb}
       ],
     };
-    // Any change after «Готово» needs «Готово» again.
-    _doc['status'] = 'work';
+    _doc['status'] = 'work'; // any change after «Готово» needs «Готово» again
     _doc.remove('result');
     _doc.remove('error');
     await _Store.putDoc(await SharedPreferences.getInstance(), _doc);
@@ -277,7 +365,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   // ── scanning ──
 
-  /// Enter from the scanner (suffix) or the keyboard.
   void _submitScan() {
     _scanTimer?.cancel();
     final code = _scanCtrl.text.trim();
@@ -289,7 +376,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   /// Scanners without an Enter suffix: accept the code 300 ms after the last char.
   void _onScanChanged(String v) {
     _scanTimer?.cancel();
-    if (_keyboard) return; // manual typing — wait for Enter
+    if (_keyboard) return;
     _scanTimer = Timer(const Duration(milliseconds: 300), () {
       if (_scanCtrl.text.trim().length >= 6) _submitScan();
     });
@@ -297,7 +384,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   void _toggleKeyboard() {
     setState(() => _keyboard = !_keyboard);
-    // the new keyboardType applies on the next focus
     _scanFocus.unfocus();
     Future.delayed(const Duration(milliseconds: 50), () {
       if (mounted) _scanFocus.requestFocus();
@@ -305,32 +391,46 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   }
 
   Future<void> _onScan(String code) async {
-    _lastScan = code;
+    setState(() => _lastScan = code);
     final hit = _barcodes[code] ?? (await _others())[code];
+    final cat = hit == null || !_byKey.containsKey('${hit[0]}|${hit[1]}') ? await _Catalog.byBarcode(code) : null;
 
-    // Resolve the line (not added to the list until a quantity is confirmed).
     String key, productKey, charKey, name;
+    String thumb = '', image = '';
     double step = 1;
-    if (hit == null) {
-      productKey = '?';
-      charKey = code;
-      key = '?|$code';
-      name = 'Неизвестный штрихкод $code';
-    } else {
+    if (hit != null) {
       productKey = hit[0];
       charKey = hit[1];
       key = '${hit[0]}|${hit[1]}';
       step = _unitCoef[hit[2]] ?? 1;
-      name = _byKey[key]?.name ?? _otherNames[hit[0]] ?? 'Товар не из документа';
+      name = _byKey[key]?.name ?? _otherNames[hit[0]] ?? (cat?['name'] ?? 'Товар не из документа').toString();
+    } else if (cat != null) {
+      // known only in the catalog (Stock API): not in this document
+      productKey = cat['id'].toString();
+      charKey = _zeroGuid;
+      key = '$productKey|$charKey';
+      name = (cat['name'] ?? '').toString();
+    } else {
+      productKey = '?';
+      charKey = code;
+      key = '?|$code';
+      name = 'Неизвестный штрихкод $code';
     }
-    final existing = _byKey[key];
+    final existing = _byKey[key] ?? _byKey['$productKey|$_zeroGuid'];
+    if (existing != null) {
+      thumb = existing.thumb;
+      image = existing.image;
+    } else if (cat != null) {
+      thumb = (cat['thumb'] ?? '').toString();
+      image = (cat['image'] ?? '').toString();
+    }
     final inDoc = existing?.inDoc ?? false;
 
-    String? next; // a barcode scanned while the dialog was open
+    String? next;
     double qty = step;
     if (_askQty) {
-      final r = await _qtyDialog(existing, name, inDoc, step);
-      if (r == null) return; // cancelled
+      final r = await _qtyDialog(existing, name, inDoc, step, image.isNotEmpty ? image : thumb, cat?['article']);
+      if (r == null) return;
       qty = r.qty;
       next = r.nextCode;
     }
@@ -338,14 +438,17 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     if (qty > 0) {
       var it = existing;
       if (it == null) {
-        it = _Item(productKey, charKey, name, inDoc: false);
+        it = _Item(productKey, charKey, name, inDoc: false)
+          ..thumb = thumb
+          ..image = image
+          ..article = (cat?['article'] ?? '').toString();
         _items.add(it);
         _byKey[it.key] = it;
       }
       it.fact += qty;
       final st = _status(it);
       if (st == _St.foreign || st == _St.excess) {
-        _alarm(st == _St.foreign ? 'Нет в документе: ${it.name}' : 'Больше заказа: ${it.name}');
+        _alarm(st == _St.foreign ? 'Нет в документе: ${it.name}' : 'Больше плана: ${it.name}');
       } else {
         HapticFeedback.lightImpact();
       }
@@ -355,10 +458,8 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     if (next != null) await _onScan(next);
   }
 
-  /// Quantity for a scanned item. Enter confirms. If the scanner fires again
-  /// while the dialog is open, the new code replaces the selected text: the
-  /// current item gets the prefilled quantity and the new code is scanned next.
-  Future<_QtyResult?> _qtyDialog(_Item? it, String name, bool inDoc, double step) async {
+  Future<_QtyResult?> _qtyDialog(
+      _Item? it, String name, bool inDoc, double step, String photo, dynamic article) async {
     final ctrl = TextEditingController(text: _fmt(step));
     ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
     _dialogOpen = true;
@@ -375,6 +476,12 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       return _QtyResult(v, null);
     }
 
+    void bump(double d) {
+      final v = (double.tryParse(ctrl.text.replaceAll(',', '.')) ?? 0) + d;
+      ctrl.text = _fmt(v < 0 ? 0 : v);
+      ctrl.selection = TextSelection.collapsed(offset: ctrl.text.length);
+    }
+
     final res = await showDialog<_QtyResult>(
       context: context,
       builder: (ctx) {
@@ -383,28 +490,63 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
           if (r != null) Navigator.pop(ctx, r);
         }
 
+        final art = (it?.article.isNotEmpty ?? false) ? it!.article : (article ?? '').toString();
         return AlertDialog(
           backgroundColor: inDoc ? null : const Color(0xFFFFEBEE),
-          title: Text(name, maxLines: 3, overflow: TextOverflow.ellipsis),
-          content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-            if (!inDoc)
-              const Padding(
-                padding: EdgeInsets.only(bottom: 8),
-                child: Text('НЕТ В ДОКУМЕНТЕ', style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
-              ),
-            if (it != null && it.inDoc)
-              Text('План ${_fmt(it.plan)} · собрано ${_fmt(it.fact)}', style: const TextStyle(fontSize: 16)),
-            if (step > 1) Text('Штрихкод упаковки: ${_fmt(step)} шт'),
-            const SizedBox(height: 8),
-            TextField(
-              controller: ctrl,
-              autofocus: true,
-              keyboardType: const TextInputType.numberWithOptions(decimal: true),
-              style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
-              decoration: const InputDecoration(labelText: 'Количество', border: OutlineInputBorder()),
-              onSubmitted: (_) => submit(),
-            ),
-          ]),
+          contentPadding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+          content: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              if (!inDoc)
+                Container(
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  margin: const EdgeInsets.only(bottom: 10),
+                  decoration: BoxDecoration(color: Colors.red.shade700, borderRadius: BorderRadius.circular(8)),
+                  child: const Text('НЕТ В ЭТОМ ДОКУМЕНТЕ',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                ),
+              if (photo.isNotEmpty)
+                Center(child: _Photo(url: _url(photo), size: 140, radius: 12)),
+              const SizedBox(height: 8),
+              Text(name, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
+              if (art.isNotEmpty) Text('арт. $art', style: const TextStyle(color: Colors.black54)),
+              if (it != null && it.inDoc) ...[
+                const SizedBox(height: 8),
+                Row(children: [
+                  _chip('План', _fmt(it.plan), Colors.blueGrey),
+                  const SizedBox(width: 8),
+                  _chip('Собрано', _fmt(it.fact), _stColor[_status(it)]!),
+                ]),
+              ],
+              if (step > 1)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text('Штрихкод упаковки: ${_fmt(step)} шт', style: const TextStyle(color: Colors.black54)),
+                ),
+              const SizedBox(height: 12),
+              Row(children: [
+                _roundBtn(Icons.remove, () => bump(-1)),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: TextField(
+                    controller: ctrl,
+                    autofocus: true,
+                    textAlign: TextAlign.center,
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    style: const TextStyle(fontSize: 30, fontWeight: FontWeight.bold),
+                    decoration: const InputDecoration(
+                        labelText: 'Количество', border: OutlineInputBorder(), isDense: true),
+                    onSubmitted: (_) => submit(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                _roundBtn(Icons.add, () => bump(1)),
+              ]),
+              const SizedBox(height: 4),
+              const Text('Enter — добавить. Следующий скан добавит этот товар сам.',
+                  style: TextStyle(fontSize: 12, color: Colors.black45)),
+            ]),
+          ),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Отмена')),
             FilledButton(onPressed: submit, child: const Text('Добавить')),
@@ -418,11 +560,25 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     return res;
   }
 
-  Future<void> _toggleAsk() async {
-    setState(() => _askQty = !_askQty);
-    (await SharedPreferences.getInstance()).setBool('tsd_ask_qty', _askQty);
-    _toast(_askQty ? 'Скан → спрашивать количество' : 'Скан → сразу +1 (упаковка — её количество)');
-  }
+  Widget _chip(String label, String value, Color color) => Expanded(
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          decoration: BoxDecoration(
+            color: color.withAlpha(30),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Column(children: [
+            Text(label, style: TextStyle(fontSize: 12, color: color)),
+            Text(value, style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: color)),
+          ]),
+        ),
+      );
+
+  Widget _roundBtn(IconData icon, VoidCallback onTap) => SizedBox(
+        width: 52,
+        height: 52,
+        child: IconButton.filledTonal(onPressed: onTap, icon: Icon(icon, size: 28)),
+      );
 
   void _alarm(String msg) {
     HapticFeedback.heavyImpact();
@@ -431,7 +587,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.red.shade700));
-    setState(() {});
   }
 
   void _toast(String msg) {
@@ -441,40 +596,20 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       ..showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  // ── dialogs ──
-
-  Future<double?> _askNumber(String title, String hint, double initial) async {
-    final ctrl = TextEditingController(text: initial == 0 ? '' : _fmt(initial));
-    _dialogOpen = true;
-    final res = await showDialog<double>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(title),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          keyboardType: const TextInputType.numberWithOptions(decimal: true),
-          decoration: InputDecoration(hintText: hint),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Отмена')),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, double.tryParse(ctrl.text.replaceAll(',', '.'))),
-            child: const Text('OK'),
-          ),
-        ],
-      ),
-    );
-    _dialogOpen = false;
-    _refocus();
-    return res;
+  Future<void> _toggleAsk() async {
+    setState(() => _askQty = !_askQty);
+    (await SharedPreferences.getInstance()).setBool('tsd_ask_qty', _askQty);
+    _toast(_askQty ? 'Скан → окно количества' : 'Скан → сразу +1');
   }
 
+  // ── dialogs ──
+
   Future<void> _editFact(_Item it) async {
-    final v = await _askNumber(it.name, 'Фактическое количество', it.fact);
-    if (v == null || v < 0) return;
-    setState(() => it.fact = v);
+    final r = await _qtyDialog(it, it.name, it.inDoc, it.fact, it.image.isNotEmpty ? it.image : it.thumb, null);
+    if (r == null) return;
+    setState(() => it.fact = r.qty); // here the number replaces the fact
     await _saveProgress();
+    if (r.nextCode != null) await _onScan(r.nextCode!);
   }
 
   Future<bool> _confirm(String title, String text, String ok) async {
@@ -498,14 +633,13 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   // ── finish: result for 1C, stored on the TSD ──
 
   Future<void> _finish() async {
-    // Goods not in the document cannot be written into it (no line, price) — remove them.
     final foreign = _items.where((i) => _status(i) == _St.foreign).toList();
     if (foreign.isNotEmpty) {
-      _alarm('Нет в документе — уберите или поставьте 0: ${foreign.map((i) => i.name).join(', ')}');
+      setState(() => _filter = _Filter.issues);
+      _alarm('Уберите товар не из документа (тап → 0): ${foreign.map((i) => i.name).join(', ')}');
       return;
     }
 
-    // Excess is allowed: 1C gets the actual quantity, the comment lists it.
     final shorts = <String>[], excess = <String>[];
     for (final i in _items.where((i) => i.inDoc)) {
       final s = _status(i);
@@ -547,7 +681,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
     final now = DateTime.now();
     String two(int v) => v.toString().padLeft(2, '0');
-    final log = StringBuffer('Проверено ТСД: ${_checker.isEmpty ? 'ТСД' : _checker} '
+    final log = StringBuffer('[ТСД✓] Проверено: ${_checker.isEmpty ? 'ТСД' : _checker} '
         '${two(now.day)}.${two(now.month)} ${two(now.hour)}:${two(now.minute)}');
     if (excess.isNotEmpty) log.write('; излишек: ${excess.join(', ')}');
     if (shorts.isNotEmpty) log.write('; недостача: ${shorts.join(', ')}');
@@ -558,7 +692,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     _doc['checkedAt'] = now.toIso8601String();
     await _Store.putDoc(await SharedPreferences.getInstance(), _doc);
 
-    _toast('Проверено. Документ будет отправлен в 1С.');
+    _toast('Проверено ✓ Отправляем в 1С…');
     if (widget.onSaved != null) {
       await widget.onSaved!();
     } else if (mounted) {
@@ -567,7 +701,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   }
 
   Future<void> _reset() async {
-    if (!await _confirm('Сбросить проверку?', 'Все отсканированные количества будут обнулены.', 'Сбросить')) return;
+    if (!await _confirm('Начать заново?', 'Все отсканированные количества будут обнулены.', 'Обнулить')) return;
     _items.removeWhere((i) => !i.inDoc);
     _byKey.removeWhere((k, i) => !i.inDoc);
     for (final i in _items) {
@@ -579,75 +713,100 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   // ── UI ──
 
-  static const _colors = {
-    _St.pending: Color(0xFFEEEEEE),
-    _St.ok: Color(0xFFC8E6C9),
-    _St.short: Color(0xFFFFF59D),
-    _St.excess: Color(0xFFFFCDD2),
-    _St.foreign: Color(0xFFFFCDD2),
-  };
-
-  static const _labels = {
-    _St.pending: 'не собрано',
-    _St.ok: 'совпало',
-    _St.short: 'недостача',
-    _St.excess: 'излишек',
-    _St.foreign: 'нет в документе',
-  };
-
-  int _rank(_St s) =>
-      const [_St.foreign, _St.excess, _St.short, _St.pending, _St.ok].indexOf(s);
+  int _rank(_St s) => const [_St.foreign, _St.excess, _St.short, _St.pending, _St.ok].indexOf(s);
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     Widget body;
     if (_loading) {
       body = const Center(child: CircularProgressIndicator());
     } else if (_error != null) {
       body = Center(
         child: Padding(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.all(24),
           child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Text(_error!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.red)),
+            const Icon(Icons.error_outline, size: 56, color: Colors.red),
             const SizedBox(height: 12),
-            FilledButton(onPressed: () => Navigator.of(context).maybePop(), child: const Text('Назад')),
+            Text(_error!, textAlign: TextAlign.center, style: const TextStyle(fontSize: 16)),
+            const SizedBox(height: 16),
+            FilledButton(onPressed: () => Navigator.of(context).maybePop(), child: const Text('Назад к списку')),
           ]),
         ),
       );
     } else {
-      final sorted = [..._items]..sort((a, b) =>
-          _rank(_status(a)).compareTo(_rank(_status(b))));
-      final done = _items.where((i) {
+      final inDocItems = _items.where((i) => i.inDoc).toList();
+      final done = inDocItems.where((i) => _status(i) == _St.ok).length;
+      final left = _items.where((i) => _status(i) == _St.pending || _status(i) == _St.short).length;
+      final issues = _items.where((i) {
         final s = _status(i);
-        return s == _St.ok;
+        return s == _St.excess || s == _St.foreign || s == _St.short;
       }).length;
-      final inDoc = _items.where((i) => i.inDoc).length;
+      final shown = _items.where((i) {
+        final s = _status(i);
+        switch (_filter) {
+          case _Filter.all:
+            return true;
+          case _Filter.left:
+            return s == _St.pending || s == _St.short;
+          case _Filter.issues:
+            return s == _St.excess || s == _St.foreign || s == _St.short;
+        }
+      }).toList()
+        ..sort((a, b) => _rank(_status(a)).compareTo(_rank(_status(b))));
       final checked = _doc['status'] == 'checked';
+      final progress = inDocItems.isEmpty ? 0.0 : done / inDocItems.length;
 
       body = Column(children: [
+        // ── header ──
         Container(
-          width: double.infinity,
-          padding: const EdgeInsets.fromLTRB(0, 4, 4, 4),
-          color: Theme.of(context).colorScheme.primaryContainer,
-          child: Row(children: [
-            IconButton(
-                tooltip: 'Назад', icon: const Icon(Icons.arrow_back), onPressed: () => Navigator.of(context).maybePop()),
-            Expanded(
-              child: Text(
-                '№ ${_doc['number'] ?? ''} · ${_doc['receiver'] ?? ''}\nсобрано $done из $inDoc'
-                '${_lastScan.isEmpty ? '' : ' · скан: $_lastScan'}',
-                style: const TextStyle(fontWeight: FontWeight.w600),
+          color: scheme.primaryContainer,
+          padding: const EdgeInsets.fromLTRB(0, 4, 0, 8),
+          child: Column(children: [
+            Row(children: [
+              IconButton(icon: const Icon(Icons.arrow_back), onPressed: () => Navigator.of(context).maybePop()),
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(
+                    (_doc['receiver'] ?? '').toString().isEmpty ? 'Перемещение' : _doc['receiver'].toString(),
+                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  Text('№ ${_doc['number'] ?? ''}${_doc['posted'] == true ? ' · проведён' : ''}',
+                      style: const TextStyle(fontSize: 13, color: Colors.black54)),
+                ]),
               ),
+              PopupMenuButton<String>(
+                onSelected: (v) => v == 'ask' ? _toggleAsk() : _reset(),
+                itemBuilder: (_) => [
+                  CheckedPopupMenuItem(value: 'ask', checked: _askQty, child: const Text('Спрашивать количество')),
+                  const PopupMenuItem(value: 'reset', child: Text('Начать заново')),
+                ],
+              ),
+            ]),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Row(children: [
+                Expanded(
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(6),
+                    child: LinearProgressIndicator(
+                      value: progress,
+                      minHeight: 10,
+                      backgroundColor: Colors.white,
+                      color: const Color(0xFF2E7D32),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Text('$done из ${inDocItems.length}', style: const TextStyle(fontWeight: FontWeight.w700)),
+              ]),
             ),
-            IconButton(
-                tooltip: _askQty ? 'Скан спрашивает количество' : 'Скан сразу добавляет',
-                icon: Icon(_askQty ? Icons.pin : Icons.exposure_plus_1),
-                onPressed: _toggleAsk),
-            IconButton(tooltip: 'Сбросить проверку', icon: const Icon(Icons.restart_alt), onPressed: _reset),
           ]),
         ),
+        // ── scan field ──
         Padding(
-          padding: const EdgeInsets.fromLTRB(8, 6, 8, 2),
+          padding: const EdgeInsets.fromLTRB(10, 10, 10, 4),
           child: TextField(
             controller: _scanCtrl,
             focusNode: _scanFocus,
@@ -657,12 +816,14 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
             textInputAction: TextInputAction.done,
             onChanged: _onScanChanged,
             onSubmitted: (_) => _submitScan(),
-            onEditingComplete: () {}, // keep the focus after Enter
+            onEditingComplete: () {},
+            style: const TextStyle(fontSize: 18),
             decoration: InputDecoration(
-              isDense: true,
-              hintText: 'Сканируйте штрихкод…',
-              prefixIcon: const Icon(Icons.qr_code_scanner),
-              border: const OutlineInputBorder(),
+              filled: true,
+              fillColor: const Color(0xFFF1F3F4),
+              hintText: _lastScan.isEmpty ? 'Сканируйте товар' : 'Последний: $_lastScan',
+              prefixIcon: const Icon(Icons.qr_code_scanner, size: 28),
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
               suffixIcon: IconButton(
                 tooltip: _keyboard ? 'Скрыть клавиатуру' : 'Ввести вручную',
                 icon: Icon(_keyboard ? Icons.keyboard_hide : Icons.keyboard),
@@ -674,41 +835,38 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
         if (checked)
           Container(
             width: double.infinity,
-            color: const Color(0xFFC8E6C9),
-            padding: const EdgeInsets.all(8),
-            child: const Text('Проверен, ждёт отправки в 1С. Любое изменение — снова «Готово».'),
+            margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(color: const Color(0xFFE8F5E9), borderRadius: BorderRadius.circular(8)),
+            child: const Text('✓ Проверен и ждёт отправки. Если что-то измените — снова «Готово».'),
           ),
-        Expanded(
-          child: ListView.builder(
-            itemCount: sorted.length,
-            itemBuilder: (ctx, i) {
-              final it = sorted[i];
-              final st = _status(it);
-              return Card(
-                color: _colors[st],
-                margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                child: ListTile(
-                  dense: true,
-                  onTap: () => _editFact(it),
-                  title: Text(it.name, maxLines: 2, overflow: TextOverflow.ellipsis),
-                  subtitle: Text([
-                    if (it.article.isNotEmpty) 'арт. ${it.article}',
-                    _labels[st]!,
-                  ].join(' · ')),
-                  trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                    Text('${_fmt(it.fact)} / ${_fmt(it.plan)}',
-                        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                  ]),
-                ),
-              );
-            },
-          ),
-        ),
+        // ── filter ──
         Padding(
-          padding: const EdgeInsets.all(8),
+          padding: const EdgeInsets.fromLTRB(10, 4, 10, 4),
+          child: Wrap(spacing: 6, runSpacing: 4, children: [
+            _filterChip(_Filter.all, 'Все ${_items.length}'),
+            _filterChip(_Filter.left, 'Осталось $left'),
+            _filterChip(_Filter.issues, 'Расхождения $issues', danger: issues > 0),
+          ]),
+        ),
+        // ── lines ──
+        Expanded(
+          child: shown.isEmpty
+              ? Center(
+                  child: Text(_filter == _Filter.left ? 'Всё собрано ✓' : 'Нет строк',
+                      style: const TextStyle(fontSize: 16, color: Colors.black54)))
+              : ListView.builder(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  itemCount: shown.length,
+                  itemBuilder: (ctx, i) => _row(shown[i]),
+                ),
+        ),
+        // ── finish ──
+        Padding(
+          padding: const EdgeInsets.fromLTRB(10, 4, 10, 10),
           child: SizedBox(
             width: double.infinity,
-            height: 48,
+            height: 56,
             child: _HoldButton(
               label: 'Готово — удерживайте',
               onConfirmed: _finish,
@@ -721,43 +879,87 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     return SizedBox(
         width: widget.width, height: widget.height, child: _EdgeSwipeBack(child: SafeArea(child: body)));
   }
+
+  Widget _filterChip(_Filter f, String label, {bool danger = false}) => ChoiceChip(
+        label: Text(label, style: TextStyle(color: danger && _filter != f ? Colors.red.shade700 : null)),
+        selected: _filter == f,
+        showCheckmark: false,
+        onSelected: (_) => setState(() => _filter = f),
+      );
+
+  Widget _row(_Item it) {
+    final st = _status(it);
+    final color = _stColor[st]!;
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      color: _stBg[st],
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: InkWell(
+        onTap: () => _editFact(it),
+        child: IntrinsicHeight(
+          child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Container(width: 6, color: color),
+            Padding(
+              padding: const EdgeInsets.all(8),
+              child: _Photo(url: _url(it.thumb), size: 52, radius: 8),
+            ),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisAlignment: MainAxisAlignment.center, children: [
+                  Text(it.name, maxLines: 2, overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 2),
+                  Text(
+                    [if (it.article.isNotEmpty) 'арт. ${it.article}', _stLabel[st]!].join(' · '),
+                    style: TextStyle(fontSize: 12, color: st == _St.pending ? Colors.black54 : color),
+                  ),
+                ]),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text(_fmt(it.fact), style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800, color: color)),
+                if (it.inDoc) Text('из ${_fmt(it.plan)}', style: const TextStyle(fontSize: 13, color: Colors.black54)),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
 }
 
-/// Swipe from the left edge → back (Navigator.maybePop). Works on any Android,
-/// also on TSDs with button navigation where the system back gesture is absent.
-/// Taps and vertical scrolling pass through to the content.
-class _EdgeSwipeBack extends StatefulWidget {
-  const _EdgeSwipeBack({required this.child});
-  final Widget child;
-
-  @override
-  State<_EdgeSwipeBack> createState() => _EdgeSwipeBackState();
-}
-
-class _EdgeSwipeBackState extends State<_EdgeSwipeBack> {
-  double _dx = 0;
+/// Product photo from Stock API, cached on disk; placeholder without photo / network.
+class _Photo extends StatelessWidget {
+  const _Photo({required this.url, required this.size, this.radius = 8});
+  final String url;
+  final double size;
+  final double radius;
 
   @override
   Widget build(BuildContext context) {
-    return Stack(children: [
-      widget.child,
-      Positioned(
-        left: 0,
-        top: 0,
-        bottom: 0,
-        width: 28,
-        child: GestureDetector(
-          behavior: HitTestBehavior.translucent,
-          onHorizontalDragStart: (_) => _dx = 0,
-          onHorizontalDragUpdate: (d) => _dx += d.delta.dx,
-          onHorizontalDragEnd: (d) {
-            if (_dx > 80 || (d.primaryVelocity ?? 0) > 400) {
-              Navigator.of(context).maybePop();
-            }
-          },
-        ),
-      ),
-    ]);
+    final placeholder = Container(
+      width: size,
+      height: size,
+      color: const Color(0xFFEEEEEE),
+      child: Icon(Icons.inventory_2_outlined, size: size * 0.45, color: Colors.black26),
+    );
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(radius),
+      child: url.isEmpty
+          ? placeholder
+          : CachedNetworkImage(
+              imageUrl: url,
+              width: size,
+              height: size,
+              fit: BoxFit.cover,
+              placeholder: (_, __) => placeholder,
+              errorWidget: (_, __, ___) => placeholder,
+            ),
+    );
   }
 }
 
@@ -767,8 +969,8 @@ class _QtyResult {
   final String? nextCode;
 }
 
-/// Button that fires only after being held for [hold] (protects «Готово»
-/// from an accidental touch). Fills while held; a short tap shows a hint.
+/// Fires only after being held for [hold] (protects «Готово» from an accidental
+/// touch). Fills while held; a short tap shows a hint.
 class _HoldButton extends StatefulWidget {
   const _HoldButton({required this.label, required this.onConfirmed, this.onTapHint});
   final String label;
@@ -811,25 +1013,66 @@ class _HoldButtonState extends State<_HoldButton> with SingleTickerProviderState
       child: AnimatedBuilder(
         animation: _c,
         builder: (ctx, _) => ClipRRect(
-          borderRadius: BorderRadius.circular(24),
+          borderRadius: BorderRadius.circular(28),
           child: Stack(fit: StackFit.expand, children: [
-            Container(color: scheme.primary.withAlpha(90)),
+            Container(color: scheme.primary),
             FractionallySizedBox(
               alignment: Alignment.centerLeft,
               widthFactor: _c.value,
-              child: Container(color: scheme.primary),
+              child: Container(color: Color.lerp(scheme.primary, Colors.black, 0.4)),
             ),
             Center(
               child: Row(mainAxisSize: MainAxisSize.min, children: [
                 Icon(Icons.check_circle, color: scheme.onPrimary),
                 const SizedBox(width: 8),
-                Text(widget.label,
-                    style: TextStyle(color: scheme.onPrimary, fontSize: 16, fontWeight: FontWeight.w600)),
+                Flexible(
+                  child: Text(widget.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: scheme.onPrimary, fontSize: 17, fontWeight: FontWeight.w700)),
+                ),
               ]),
             ),
           ]),
         ),
       ),
     );
+  }
+}
+
+/// Swipe from the left edge → back (Navigator.maybePop). Works on any Android,
+/// also on TSDs with button navigation where the system back gesture is absent.
+class _EdgeSwipeBack extends StatefulWidget {
+  const _EdgeSwipeBack({required this.child});
+  final Widget child;
+
+  @override
+  State<_EdgeSwipeBack> createState() => _EdgeSwipeBackState();
+}
+
+class _EdgeSwipeBackState extends State<_EdgeSwipeBack> {
+  double _dx = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(children: [
+      widget.child,
+      Positioned(
+        left: 0,
+        top: 0,
+        bottom: 0,
+        width: 28,
+        child: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onHorizontalDragStart: (_) => _dx = 0,
+          onHorizontalDragUpdate: (d) => _dx += d.delta.dx,
+          onHorizontalDragEnd: (d) {
+            if (_dx > 80 || (d.primaryVelocity ?? 0) > 400) {
+              Navigator.of(context).maybePop();
+            }
+          },
+        ),
+      ),
+    ]);
   }
 }
