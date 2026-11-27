@@ -2,21 +2,17 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:sqflite/sqflite.dart';
 
 /// Offline check of one «Перемещение товаров» downloaded by TransferListWidget.
-/// No network for the check itself: document, names, units and barcodes are on
-/// the TSD; the goods catalog with photos (Stock API) is in SQLite.
+/// No network: document, names, articles, units and barcodes (from 1C) are on the TSD.
 ///
-/// Scan → quantity dialog (prefilled 1, or the package quantity for a package
-/// barcode). fact = plan → OK, less → shortage, more → excess (allowed after
-/// confirmation, listed in the comment). Goods not in the document block
-/// «Готово». «Готово» is a hold-to-confirm button; the result is stored on the
+/// Scan or typed article → quantity dialog (prefilled 1, or the package quantity
+/// for a package barcode; weighed goods: the weight is typed). fact = plan → OK,
+/// less → shortage, more → excess (allowed after confirmation, listed in the
+/// comment). Goods not in the document only show a warning and are not added. «Готово» is a hold-to-confirm button; the result is stored on the
 /// TSD and TransferListWidget sends it to 1C.
 class TransferCheckWidget extends StatefulWidget {
   const TransferCheckWidget({
@@ -68,68 +64,11 @@ class _Store {
   static Map<String, dynamic>? prod(SharedPreferences p, String key) => read(p, '$prodPrefix$key');
 }
 
-/// Goods catalog from Stock API (filled by TransferListWidget), read-only here.
-class _Catalog {
-  static Database? _db;
-
-  static Future<Database?> open() async {
-    if (_db != null) return _db;
-    try {
-      final path = p.join(await getDatabasesPath(), 'tsd_catalog.db');
-      if (!await databaseExists(path)) return null;
-      return _db = await openDatabase(path); // same instance as the list widget (read-write)
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /// barcode → {id, name, article, unit, thumb, image}
-  static Future<Map<String, dynamic>?> byBarcode(String code) async {
-    final db = await open();
-    if (db == null) return null;
-    final r = await db.rawQuery(
-        'SELECT p.* FROM barcodes b JOIN products p ON p.id = b.id WHERE b.code = ? LIMIT 1', [code]);
-    return r.isEmpty ? null : Map<String, dynamic>.from(r.first);
-  }
-
-  /// article (as typed: «435», «00435») → products, at most [limit]
-  static Future<List<Map<String, dynamic>>> byArticle(String code, {int limit = 20}) async {
-    final db = await open();
-    if (db == null) return const [];
-    final n = _normArticle(code);
-    if (n.isEmpty) return const [];
-    // LTRIM(…, '0') so «00435» in the catalog matches «435» typed on the TSD
-    final r = await db.rawQuery(
-        "SELECT * FROM products WHERE LOWER(LTRIM(TRIM(article), '0')) = ? LIMIT ?", [n, limit]);
-    return [for (final x in r) Map<String, dynamic>.from(x)];
-  }
-
-  static Future<Map<String, Map<String, dynamic>>> byIds(Iterable<String> ids) async {
-    final db = await open();
-    final out = <String, Map<String, dynamic>>{};
-    if (db == null) return out;
-    final all = ids.toSet().toList();
-    for (var i = 0; i < all.length; i += 500) {
-      final part = all.sublist(i, math.min(i + 500, all.length));
-      for (final r in await db.query('products', where: 'id IN (${List.filled(part.length, '?').join(',')})', whereArgs: part)) {
-        out[r['id'].toString()] = Map<String, dynamic>.from(r);
-      }
-    }
-    return out;
-  }
-
-  static Future<String> base() async {
-    final prefs = await SharedPreferences.getInstance();
-    final s = _Store.read(prefs, 'tsd_settings') ?? {};
-    return (s['stockUrl'] ?? '').toString().trim().replaceAll(RegExp(r'/+$'), '');
-  }
-}
-
 // ───────────────────────────── model ─────────────────────────────
 
 const _zeroGuid = '00000000-0000-0000-0000-000000000000';
 
-enum _St { pending, ok, short, excess, foreign }
+enum _St { pending, ok, short, excess }
 
 class _DocLine {
   _DocLine(this.raw);
@@ -139,15 +78,12 @@ class _DocLine {
 }
 
 class _Item {
-  _Item(this.productKey, this.charKey, this.name, {this.inDoc = true});
+  _Item(this.productKey, this.charKey, this.name);
   final String productKey;
   final String charKey;
   String name;
   String article = '';
-  String thumb = '';
-  String image = '';
   bool weight = false;
-  final bool inDoc;
   final List<_DocLine> lines = [];
   double fact = 0;
 
@@ -167,7 +103,6 @@ String _fmt(double v) {
 
 _St _status(_Item it) {
   final plan = it.plan, fact = it.fact;
-  if (!it.inDoc) return fact > 0 ? _St.foreign : _St.pending;
   if (fact == 0) return _St.pending;
   if ((fact - plan).abs() < 1e-6) return _St.ok;
   return fact < plan ? _St.short : _St.excess;
@@ -178,7 +113,6 @@ const _stColor = {
   _St.ok: Color(0xFF2E7D32),
   _St.short: Color(0xFFF9A825),
   _St.excess: Color(0xFFC62828),
-  _St.foreign: Color(0xFFC62828),
 };
 
 const _stBg = {
@@ -186,7 +120,6 @@ const _stBg = {
   _St.ok: Color(0xFFE8F5E9),
   _St.short: Color(0xFFFFF8E1),
   _St.excess: Color(0xFFFFEBEE),
-  _St.foreign: Color(0xFFFFEBEE),
 };
 
 const _stLabel = {
@@ -194,7 +127,6 @@ const _stLabel = {
   _St.ok: 'совпало',
   _St.short: 'недостача',
   _St.excess: 'излишек',
-  _St.foreign: 'нет в документе',
 };
 
 enum _Filter { all, left, issues }
@@ -214,16 +146,13 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   /// barcode → (productKey, charKey, unitKey); goods of this document (from 1C)
   final Map<String, List<String>> _barcodes = {};
 
-  /// barcodes / names of goods of the other downloaded documents
+  /// barcodes / names / articles of goods of the other downloaded documents
   Map<String, List<String>>? _otherCodes;
   final Map<String, String> _otherNames = {};
 
-  /// normalized article → productKeys, and weighed goods, of the other downloaded documents
-  final Map<String, List<String>> _otherArticles = {};
-  final Set<String> _otherWeight = {};
+  final Map<String, List<String>> _otherArticles = {}; // normalized article → productKeys
 
   final Map<String, double> _unitCoef = {};
-  String _stockBase = '';
 
   String _checker = '';
   bool _dialogOpen = false;
@@ -264,8 +193,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     });
   }
 
-  String _url(String path) => path.isEmpty || _stockBase.isEmpty ? '' : '$_stockBase$path';
-
   // ── loading (local only) ──
 
   Future<void> _load() async {
@@ -276,7 +203,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       _checker = (widget.checkerName?.isNotEmpty ?? false)
           ? widget.checkerName!
           : (settings['checkerName'] ?? '').toString();
-      _stockBase = await _Catalog.base();
 
       final doc = _Store.doc(prefs, widget.transferKey);
       if (doc == null) throw 'Документа нет на ТСД.\nНажмите «Загрузить» на списке.';
@@ -297,15 +223,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       for (final pk in keys) {
         final e = _Store.prod(prefs, pk);
         if (e != null) _apply(pk, e);
-      }
-      // photos (and names, if 1C data is missing) from the catalog
-      final cat = await _Catalog.byIds(keys);
-      for (final it in _items) {
-        final c = cat[it.productKey];
-        if (c == null) continue;
-        it.thumb = (c['thumb'] ?? '').toString();
-        it.image = (c['image'] ?? '').toString();
-        if (it.name.length <= 8) it.name = (c['name'] ?? it.name).toString();
       }
       _restoreProgress();
     } catch (e) {
@@ -340,7 +257,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       _otherNames[pk] = (e['name'] ?? '').toString();
       final art = _normArticle((e['article'] ?? '').toString());
       if (art.isNotEmpty) _otherArticles.putIfAbsent(art, () => []).add(pk);
-      if (e['weight'] == true) _otherWeight.add(pk);
       for (final u in (e['units'] as List? ?? const [])) {
         _unitCoef.putIfAbsent(u[0].toString(), () => math.max(1.0, _num(u[1])));
       }
@@ -356,23 +272,12 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   void _restoreProgress() {
     final m = _doc['progress'] as Map<String, dynamic>?;
     if (m == null) return;
-    for (final f in ((m['foreign'] as List?) ?? const [])) {
-      final it = _Item(f['p'], f['c'], f['n'], inDoc: false)
-        ..fact = _num(f['f'])
-        ..thumb = (f['t'] ?? '').toString();
-      _items.add(it);
-      _byKey[it.key] = it;
-    }
     (m['facts'] as Map<String, dynamic>? ?? {}).forEach((k, v) => _byKey[k]?.fact = _num(v));
   }
 
   Future<void> _saveProgress() async {
     _doc['progress'] = {
       'facts': {for (final i in _items) if (i.fact != 0) i.key: i.fact},
-      'foreign': [
-        for (final i in _items.where((i) => !i.inDoc))
-          {'p': i.productKey, 'c': i.charKey, 'n': i.name, 'f': i.fact, 't': i.thumb}
-      ],
     };
     _doc['status'] = 'work'; // any change after «Готово» needs «Готово» again
     _doc.remove('result');
@@ -417,76 +322,35 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   Future<void> _onScan(String code) async {
     setState(() => _lastScan = code);
+    // barcode of this document / of another downloaded document, else article
     var hit = _barcodes[code] ?? (await _others())[code];
-    Map<String, dynamic>? cat;
     if (hit == null) {
-      // not a barcode → article (weighed goods usually have no barcode in 1C)
       final byArt = await _findByArticle(code);
       if (byArt == _cancelled) return;
-      if (byArt is List<String>) hit = byArt;
-      if (byArt is Map<String, dynamic>) cat = byArt;
+      hit = byArt as List<String>?;
     }
-    if (cat == null && (hit == null || !_byKey.containsKey('${hit[0]}|${hit[1]}'))) {
-      cat = await _Catalog.byBarcode(code);
+    final it = hit == null ? null : (_byKey['${hit[0]}|${hit[1]}'] ?? _byKey['${hit[0]}|$_zeroGuid']);
+    if (it == null) {
+      // not in this document: only a warning, nothing is added
+      final next = await _notInDocDialog(code, hit == null ? null : _otherNames[hit[0]]);
+      if (next != null) await _onScan(next);
+      return;
     }
-
-    String key, productKey, charKey, name;
-    String thumb = '', image = '';
-    double step = 1;
-    if (hit != null) {
-      productKey = hit[0];
-      charKey = hit[1];
-      key = '${hit[0]}|${hit[1]}';
-      step = _unitCoef[hit[2]] ?? 1;
-      name = _byKey[key]?.name ?? _otherNames[hit[0]] ?? (cat?['name'] ?? 'Товар не из документа').toString();
-    } else if (cat != null) {
-      // known only in the catalog (Stock API): not in this document
-      productKey = cat['id'].toString();
-      charKey = _zeroGuid;
-      key = '$productKey|$charKey';
-      name = (cat['name'] ?? '').toString();
-    } else {
-      productKey = '?';
-      charKey = code;
-      key = '?|$code';
-      name = 'Не найден штрихкод / артикул $code';
-    }
-    final existing = _byKey[key] ?? _byKey['$productKey|$_zeroGuid'];
-    if (existing != null) {
-      thumb = existing.thumb;
-      image = existing.image;
-    } else if (cat != null) {
-      thumb = (cat['thumb'] ?? '').toString();
-      image = (cat['image'] ?? '').toString();
-    }
-    final inDoc = existing?.inDoc ?? false;
-    final weight = existing?.weight ?? _otherWeight.contains(productKey);
+    final step = _unitCoef[hit![2]] ?? 1;
 
     String? next;
     double qty = step;
-    if (_askQty || weight) {
-      final r = await _qtyDialog(existing, name, inDoc, step, image.isNotEmpty ? image : thumb, cat?['article'],
-          weight: weight);
+    if (_askQty || it.weight) {
+      final r = await _qtyDialog(it, step);
       if (r == null) return;
       qty = r.qty;
       next = r.nextCode;
     }
 
     if (qty > 0) {
-      var it = existing;
-      if (it == null) {
-        it = _Item(productKey, charKey, name, inDoc: false)
-          ..weight = weight
-          ..thumb = thumb
-          ..image = image
-          ..article = (cat?['article'] ?? '').toString();
-        _items.add(it);
-        _byKey[it.key] = it;
-      }
       it.fact += qty;
-      final st = _status(it);
-      if (st == _St.foreign || st == _St.excess) {
-        _alarm(st == _St.foreign ? 'Нет в документе: ${it.name}' : 'Больше плана: ${it.name}');
+      if (_status(it) == _St.excess) {
+        _alarm('Больше плана: ${it.name}');
       } else {
         HapticFeedback.lightImpact();
       }
@@ -498,13 +362,13 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   static const _cancelled = Object();
 
-  /// Typed article → goods of this document (several: pick one), then goods of the
-  /// other downloaded documents, then the catalog. Returns a barcode-like hit
-  /// [productKey, charKey, unitKey], a catalog row, null (nothing) or [_cancelled].
+  /// Typed article (weighed goods usually have no barcode in 1C) → goods of this
+  /// document (several: pick one), then goods of the other downloaded documents
+  /// (→ «not in this document»). Returns [productKey, charKey, unitKey], null or [_cancelled].
   Future<Object?> _findByArticle(String code) async {
     final n = _normArticle(code);
     if (n.isEmpty) return null;
-    final inDoc = _items.where((i) => i.inDoc && _normArticle(i.article) == n).toList();
+    final inDoc = _items.where((i) => _normArticle(i.article) == n).toList();
     if (inDoc.isNotEmpty) {
       final it = inDoc.length == 1 ? inDoc.first : await _pickItem(inDoc, code);
       if (it == null) return _cancelled;
@@ -513,8 +377,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     await _others();
     final other = _otherArticles[n];
     if (other != null && other.isNotEmpty) return [other.first, _zeroGuid, ''];
-    final cat = await _Catalog.byArticle(code);
-    return cat.isEmpty ? null : cat.first;
+    return null;
   }
 
   Future<_Item?> _pickItem(List<_Item> items, String code) async {
@@ -537,23 +400,78 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     return r;
   }
 
-  Future<_QtyResult?> _qtyDialog(
-      _Item? it, String name, bool inDoc, double step, String photo, dynamic article,
-      {bool weight = false}) async {
-    // weighed goods: no default, the weight must be typed
-    final ctrl = TextEditingController(text: weight ? '' : _fmt(step));
-    final hint = ValueNotifier<String?>(null);
-    ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
+  /// Red warning for goods not in this document. Has its own scan field, so the
+  /// next scan closes the warning and is processed. Returns that next code.
+  Future<String?> _notInDocDialog(String code, String? name) async {
     _dialogOpen = true;
-    if (!inDoc) {
-      HapticFeedback.heavyImpact();
-      SystemSound.play(SystemSoundType.alert);
-    }
+    HapticFeedback.heavyImpact();
+    SystemSound.play(SystemSoundType.alert);
+    final ctrl = TextEditingController();
+    var closed = false;
+    final next = await showDialog<String>(
+      context: context,
+      builder: (ctx) {
+        void close([String? value]) {
+          if (closed) return;
+          closed = true;
+          Navigator.pop(ctx, value);
+        }
+
+        return AlertDialog(
+          backgroundColor: const Color(0xFFFFEBEE),
+          contentPadding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+          content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              decoration: BoxDecoration(color: Colors.red.shade700, borderRadius: BorderRadius.circular(8)),
+              child: Text(name == null ? 'НЕ НАЙДЕНО' : 'НЕТ В ЭТОМ ДОКУМЕНТЕ',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+            ),
+            const SizedBox(height: 12),
+            if (name != null) Text(name, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
+            Text(name == null ? 'Штрихкод / артикул $code нет в накладной' : 'Штрихкод / артикул $code',
+                style: const TextStyle(color: Colors.black54)),
+            const SizedBox(height: 8),
+            const Text('Отложите товар. В проверку он не добавляется.'),
+            // invisible scan target: the next scan closes the warning
+            SizedBox(
+              height: 1,
+              child: Opacity(
+                opacity: 0,
+                child: TextField(
+                  controller: ctrl,
+                  autofocus: true,
+                  keyboardType: TextInputType.none,
+                  onSubmitted: (_) => Future.delayed(_enterSettle, () {
+                    final t = ctrl.text.trim();
+                    if (ctx.mounted) close(t.isEmpty ? null : t);
+                  }),
+                ),
+              ),
+            ),
+          ]),
+          actions: [FilledButton(onPressed: close, child: const Text('OK'))],
+        );
+      },
+    );
+    _dialogOpen = false;
+    _refocus();
+    ctrl.dispose();
+    return next;
+  }
+
+  Future<_QtyResult?> _qtyDialog(_Item it, double step, {bool replace = false}) async {
+    // weighed goods: no default for a new scan, the weight must be typed
+    final ctrl = TextEditingController(text: it.weight && !replace ? '' : _fmt(step));
+    ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
+    final hint = ValueNotifier<String?>(null);
+    _dialogOpen = true;
 
     _QtyResult? parse(String raw) {
       final t = raw.trim();
       if (t.length >= 8 && RegExp(r'^\d+$').hasMatch(t)) {
-        if (!weight) return _QtyResult(step, t); // next barcode
+        if (!it.weight) return _QtyResult(step, t); // next barcode
         ctrl.clear();
         hint.value = 'Сначала введите вес';
         return null;
@@ -585,35 +503,19 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
               if (ctx.mounted) submit();
             });
 
-        final art = (it?.article.isNotEmpty ?? false) ? it!.article : (article ?? '').toString();
         return AlertDialog(
-          backgroundColor: inDoc ? null : const Color(0xFFFFEBEE),
           contentPadding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
           content: SingleChildScrollView(
             child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-              if (!inDoc)
-                Container(
-                  padding: const EdgeInsets.symmetric(vertical: 6),
-                  margin: const EdgeInsets.only(bottom: 10),
-                  decoration: BoxDecoration(color: Colors.red.shade700, borderRadius: BorderRadius.circular(8)),
-                  child: const Text('НЕТ В ЭТОМ ДОКУМЕНТЕ',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                ),
-              if (photo.isNotEmpty)
-                Center(child: _Photo(url: _url(photo), size: 140, radius: 12)),
+              Text(it.name, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
+              if (it.article.isNotEmpty) Text('арт. ${it.article}', style: const TextStyle(color: Colors.black54)),
               const SizedBox(height: 8),
-              Text(name, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
-              if (art.isNotEmpty) Text('арт. $art', style: const TextStyle(color: Colors.black54)),
-              if (it != null && it.inDoc) ...[
-                const SizedBox(height: 8),
-                Row(children: [
-                  _chip('План', _fmt(it.plan), Colors.blueGrey),
-                  const SizedBox(width: 8),
-                  _chip('Собрано', _fmt(it.fact), _stColor[_status(it)]!),
-                ]),
-              ],
-              if (step > 1)
+              Row(children: [
+                _chip('План', _fmt(it.plan), Colors.blueGrey),
+                const SizedBox(width: 8),
+                _chip('Собрано', _fmt(it.fact), _stColor[_status(it)]!),
+              ]),
+              if (step > 1 && !replace)
                 Padding(
                   padding: const EdgeInsets.only(top: 6),
                   child: Text('Штрихкод упаковки: ${_fmt(step)} шт', style: const TextStyle(color: Colors.black54)),
@@ -630,7 +532,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
                     keyboardType: const TextInputType.numberWithOptions(decimal: true),
                     style: const TextStyle(fontSize: 30, fontWeight: FontWeight.bold),
                     decoration: InputDecoration(
-                        labelText: weight ? 'Вес, кг' : 'Количество',
+                        labelText: replace ? 'Факт' : (it.weight ? 'Вес, кг' : 'Количество'),
                         border: const OutlineInputBorder(),
                         isDense: true),
                     onSubmitted: (_) => submitLater(),
@@ -644,7 +546,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
                 valueListenable: hint,
                 builder: (_, h, _) => Text(
                     h ??
-                        (weight
+                        (it.weight
                             ? 'Весовой товар: введите вес, Enter — добавить.'
                             : 'Enter — добавить. Следующий скан добавит этот товар сам.'),
                     style: TextStyle(fontSize: 12, color: h != null ? Colors.red.shade700 : Colors.black45)),
@@ -716,7 +618,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   // ── dialogs ──
 
   Future<void> _editFact(_Item it) async {
-    final r = await _qtyDialog(it, it.name, it.inDoc, it.fact, it.image.isNotEmpty ? it.image : it.thumb, null);
+    final r = await _qtyDialog(it, it.fact, replace: true);
     if (r == null) return;
     setState(() => it.fact = r.qty); // here the number replaces the fact
     await _saveProgress();
@@ -744,15 +646,8 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   // ── finish: result for 1C, stored on the TSD ──
 
   Future<void> _finish() async {
-    final foreign = _items.where((i) => _status(i) == _St.foreign).toList();
-    if (foreign.isNotEmpty) {
-      setState(() => _filter = _Filter.issues);
-      _alarm('Уберите товар не из документа (тап → 0): ${foreign.map((i) => i.name).join(', ')}');
-      return;
-    }
-
     final shorts = <String>[], excess = <String>[];
-    for (final i in _items.where((i) => i.inDoc)) {
+    for (final i in _items) {
       final s = _status(i);
       final line = '${i.name} ${_fmt(i.plan)}→${_fmt(i.fact)}';
       if (s == _St.short || s == _St.pending) shorts.add(line);
@@ -767,7 +662,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     }
 
     final rows = <Map<String, dynamic>>[];
-    for (final it in _items.where((i) => i.inDoc)) {
+    for (final it in _items) {
       var rest = it.fact;
       for (var n = 0; n < it.lines.length; n++) {
         final line = it.lines[n];
@@ -813,8 +708,6 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   Future<void> _reset() async {
     if (!await _confirm('Начать заново?', 'Все отсканированные количества будут обнулены.', 'Обнулить')) return;
-    _items.removeWhere((i) => !i.inDoc);
-    _byKey.removeWhere((k, i) => !i.inDoc);
     for (final i in _items) {
       i.fact = 0;
     }
@@ -824,7 +717,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   // ── UI ──
 
-  int _rank(_St s) => const [_St.foreign, _St.excess, _St.short, _St.pending, _St.ok].indexOf(s);
+  int _rank(_St s) => const [_St.excess, _St.short, _St.pending, _St.ok].indexOf(s);
 
   @override
   Widget build(BuildContext context) {
@@ -846,12 +739,12 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
         ),
       );
     } else {
-      final inDocItems = _items.where((i) => i.inDoc).toList();
+      final inDocItems = _items;
       final done = inDocItems.where((i) => _status(i) == _St.ok).length;
       final left = _items.where((i) => _status(i) == _St.pending || _status(i) == _St.short).length;
       final issues = _items.where((i) {
         final s = _status(i);
-        return s == _St.excess || s == _St.foreign || s == _St.short;
+        return s == _St.excess || s == _St.short;
       }).length;
       final shown = _items.where((i) {
         final s = _status(i);
@@ -861,7 +754,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
           case _Filter.left:
             return s == _St.pending || s == _St.short;
           case _Filter.issues:
-            return s == _St.excess || s == _St.foreign || s == _St.short;
+            return s == _St.excess || s == _St.short;
         }
       }).toList()
         ..sort((a, b) => _rank(_status(a)).compareTo(_rank(_status(b))));
@@ -1011,13 +904,9 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
         child: IntrinsicHeight(
           child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
             Container(width: 6, color: color),
-            Padding(
-              padding: const EdgeInsets.all(8),
-              child: _Photo(url: _url(it.thumb), size: 52, radius: 8),
-            ),
             Expanded(
               child: Padding(
-                padding: const EdgeInsets.symmetric(vertical: 8),
+                padding: const EdgeInsets.fromLTRB(12, 10, 0, 10),
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisAlignment: MainAxisAlignment.center, children: [
                   Text(it.name, maxLines: 2, overflow: TextOverflow.ellipsis,
                       style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
@@ -1033,43 +922,12 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
               padding: const EdgeInsets.symmetric(horizontal: 12),
               child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.end, children: [
                 Text(_fmt(it.fact), style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800, color: color)),
-                if (it.inDoc) Text('из ${_fmt(it.plan)}', style: const TextStyle(fontSize: 13, color: Colors.black54)),
+                Text('из ${_fmt(it.plan)}', style: const TextStyle(fontSize: 13, color: Colors.black54)),
               ]),
             ),
           ]),
         ),
       ),
-    );
-  }
-}
-
-/// Product photo from Stock API, cached on disk; placeholder without photo / network.
-class _Photo extends StatelessWidget {
-  const _Photo({required this.url, required this.size, this.radius = 8});
-  final String url;
-  final double size;
-  final double radius;
-
-  @override
-  Widget build(BuildContext context) {
-    final placeholder = Container(
-      width: size,
-      height: size,
-      color: const Color(0xFFEEEEEE),
-      child: Icon(Icons.inventory_2_outlined, size: size * 0.45, color: Colors.black26),
-    );
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(radius),
-      child: url.isEmpty
-          ? placeholder
-          : CachedNetworkImage(
-              imageUrl: url,
-              width: size,
-              height: size,
-              fit: BoxFit.cover,
-              placeholder: (_, __) => placeholder,
-              errorWidget: (_, __, ___) => placeholder,
-            ),
     );
   }
 }

@@ -1,19 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
-import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:sqflite/sqflite.dart';
 
 /// Offline-first list of transfers on the TSD.
 ///
 /// «Загрузить накладные» downloads today's «Перемещение товаров» of the
 /// warehouse (posted and unposted, not yet checked) with their lines + names /
-/// units / barcodes of the goods from 1C, then updates the goods catalog with
-/// photos from Stock API (SQLite) and pre-caches photos of today's goods.
+/// units / barcodes / articles of the goods from 1C.
 /// The check itself (TransferCheckWidget) works without network. Checked
 /// documents are sent to 1C here: automatically after the check and with
 /// «Отправить». A posted document is re-posted (Unpost → write → Post).
@@ -149,112 +145,6 @@ class _Store {
   }
 }
 
-// ───────────────────────────── goods catalog (Stock API → SQLite) ─────────────────────────────
-
-class _Catalog {
-  static Database? _db;
-
-  static Future<Database> open() async {
-    if (_db != null) return _db!;
-    final path = p.join(await getDatabasesPath(), 'tsd_catalog.db');
-    return _db = await openDatabase(path, version: 1, onCreate: (db, v) async {
-      await db.execute('CREATE TABLE products (id TEXT PRIMARY KEY, name TEXT, article TEXT, unit TEXT, '
-          'thumb TEXT, image TEXT, active INTEGER)');
-      await db.execute('CREATE TABLE barcodes (code TEXT PRIMARY KEY, id TEXT)');
-      await db.execute('CREATE INDEX barcodes_id ON barcodes(id)');
-      await db.execute('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)');
-    });
-  }
-
-  static Future<int> count() async {
-    try {
-      final db = await open();
-      return Sqflite.firstIntValue(await db.rawQuery('SELECT COUNT(*) FROM products')) ?? 0;
-    } catch (_) {
-      return 0;
-    }
-  }
-
-  /// First time — the whole catalog, then only changes (updated_since), pages of 1000.
-  /// Returns the number of received products.
-  static Future<int> sync(String base, String key, void Function(int) progress) async {
-    final db = await open();
-    final meta = await db.query('meta', where: 'k = ?', whereArgs: ['since']);
-    final since = meta.isEmpty ? null : meta.first['v'].toString();
-    final started = DateTime.now().toUtc().subtract(const Duration(minutes: 5)).toIso8601String();
-    var offset = 0, total = 0;
-    while (true) {
-      final params = {
-        'stocks': 'false',
-        'limit': '1000',
-        'offset': '$offset',
-        if (since != null) 'updated_since': since,
-      };
-      final q = params.entries.map((e) => '${e.key}=${Uri.encodeComponent(e.value)}').join('&');
-      http.Response r;
-      try {
-        r = await http.get(Uri.parse('$base/api/stock/products?$q'),
-            headers: {'X-API-Key': key, 'Accept': 'application/json'}).timeout(const Duration(seconds: 60));
-      } catch (e) {
-        throw 'Stock API: нет связи ($e)';
-      }
-      if (r.statusCode == 401 || r.statusCode == 403) throw 'Stock API: неверный ключ';
-      if (r.statusCode != 200) throw 'Stock API: HTTP ${r.statusCode}';
-      final items = ((jsonDecode(utf8.decode(r.bodyBytes))['items'] as List?) ?? const [])
-          .cast<Map<String, dynamic>>();
-      await db.transaction((tx) async {
-        final b = tx.batch();
-        for (final it in items) {
-          final id = (it['external_id'] ?? '').toString();
-          if (id.isEmpty) continue;
-          b.insert(
-              'products',
-              {
-                'id': id,
-                'name': (it['name'] ?? '').toString(),
-                'article': (it['article'] ?? '').toString(),
-                'unit': (it['unit'] ?? '').toString(),
-                'thumb': (it['thumb'] ?? '').toString(),
-                'image': (it['image'] ?? '').toString(),
-                'active': it['is_active'] == false ? 0 : 1,
-              },
-              conflictAlgorithm: ConflictAlgorithm.replace);
-          b.delete('barcodes', where: 'id = ?', whereArgs: [id]);
-          final codes = <String>{
-            ...((it['barcodes'] as List?) ?? const []).map((e) => e.toString()),
-            if ((it['barcode'] ?? '').toString().isNotEmpty) it['barcode'].toString(),
-          };
-          for (final c in codes) {
-            b.insert('barcodes', {'code': c, 'id': id}, conflictAlgorithm: ConflictAlgorithm.replace);
-          }
-        }
-        await b.commit(noResult: true);
-      });
-      total += items.length;
-      progress(total);
-      if (items.length < 1000) break;
-      offset += 1000;
-    }
-    await db.insert('meta', {'k': 'since', 'v': started}, conflictAlgorithm: ConflictAlgorithm.replace);
-    return total;
-  }
-
-  static Future<List<String>> thumbs(Iterable<String> ids) async {
-    final db = await open();
-    final all = ids.toSet().toList();
-    final out = <String>[];
-    for (var i = 0; i < all.length; i += 500) {
-      final part = all.sublist(i, i + 500 > all.length ? all.length : i + 500);
-      for (final r in await db.query('products',
-          columns: ['thumb'], where: 'id IN (${List.filled(part.length, '?').join(',')})', whereArgs: part)) {
-        final t = (r['thumb'] ?? '').toString();
-        if (t.isNotEmpty) out.add(t);
-      }
-    }
-    return out;
-  }
-}
-
 // ───────────────────────────── 1C OData client ─────────────────────────────
 
 class _ODataError implements Exception {
@@ -378,9 +268,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
   String _search = '';
   String? _busy; // text of the running operation
   String? _error;
-  String? _warning; // catalog problems: the 1C part still worked
   String _lastLoad = '';
-  int _catalogCount = 0;
 
   // resolved settings
   String _root = '';
@@ -388,8 +276,6 @@ class _TransferListWidgetState extends State<TransferListWidget> {
   String _pass = '';
   String _warehouse = '';
   String _warehouseName = '';
-  String _stockUrl = '';
-  String _stockKey = '';
 
   bool get _noSettings => _root.isEmpty || _warehouse.isEmpty;
 
@@ -404,7 +290,6 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     final prefs = await SharedPreferences.getInstance();
     await _Store.cleanup(prefs); // history older than 7 days
     _lastLoad = prefs.getString('tsd_last_load') ?? '';
-    _catalogCount = await _Catalog.count();
     await _refreshLocal();
   }
 
@@ -421,8 +306,6 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     _pass = (widget.password?.isNotEmpty ?? false) ? widget.password! : (m['password'] ?? '').toString();
     _warehouse = pick(widget.warehouseKey, 'warehouseKey');
     _warehouseName = (m['warehouseName'] ?? '').toString();
-    _stockUrl = (m['stockUrl'] ?? '').toString().trim().replaceAll(RegExp(r'/+$'), '');
-    _stockKey = (m['stockKey'] ?? '').toString().trim();
   }
 
   _OData get _od => _OData(_root, _user, _pass);
@@ -464,7 +347,6 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     setState(() {
       _busy = 'Загрузка накладных из 1С…';
       _error = null;
-      _warning = null;
     });
     String summary = '';
     try {
@@ -551,8 +433,6 @@ class _TransferListWidgetState extends State<TransferListWidget> {
           '${conflicts > 0 ? ', конфликтов $conflicts' : ''}';
       if (markLost > 0) summary += '. У $markLost отправленных стёрта отметка $_mark в 1С';
 
-      await _syncCatalog(prefs);
-
       _lastLoad = DateTime.now().toIso8601String();
       await prefs.setString('tsd_last_load', _lastLoad);
       _toast(summary);
@@ -561,42 +441,6 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     }
     if (mounted) setState(() => _busy = null);
     await _refreshLocal();
-  }
-
-  /// Catalog with photos from Stock API + photos of today's goods into the cache.
-  /// Failures here do not break the 1C part (shown as a warning).
-  Future<void> _syncCatalog(SharedPreferences prefs) async {
-    if (_stockUrl.isEmpty || _stockKey.isEmpty) {
-      _warning = 'Каталог с фото не подключён: укажите Stock API в настройках';
-      return;
-    }
-    try {
-      if (mounted) setState(() => _busy = 'Каталог товаров…');
-      await _Catalog.sync(_stockUrl, _stockKey, (n) {
-        if (mounted) setState(() => _busy = 'Каталог товаров: $n…');
-      });
-      _catalogCount = await _Catalog.count();
-
-      final ids = <String>{
-        for (final d in _Store.docs(prefs).where((d) => d['status'] != 'sent'))
-          for (final l in (d['lines'] as List? ?? const [])) (l['Номенклатура_Key'] ?? '').toString(),
-      };
-      final thumbs = await _Catalog.thumbs(ids);
-      var n = 0;
-      for (var i = 0; i < thumbs.length && i < 600; i += 6) {
-        if (!mounted) return;
-        setState(() => _busy = 'Фото товаров: ${i + 1} из ${thumbs.length}');
-        await Future.wait(thumbs.skip(i).take(6).map((t) async {
-          try {
-            await precacheImage(CachedNetworkImageProvider('$_stockUrl$t'), context);
-            n++;
-          } catch (_) {}
-        }));
-      }
-      if (n < thumbs.length) _warning = 'Загружено фото: $n из ${thumbs.length}';
-    } catch (e) {
-      _warning = 'Каталог не обновлён: $e';
-    }
   }
 
   Map<String, dynamic> _fromRemote(Map<String, dynamic> m, Map<String, String> names) => {
@@ -884,7 +728,6 @@ class _TransferListWidgetState extends State<TransferListWidget> {
     if (widget.onSettings == null) return;
     await widget.onSettings!();
     await _readSettings();
-    _catalogCount = await _Catalog.count();
     if (mounted) setState(() {});
   }
 
@@ -987,10 +830,7 @@ class _TransferListWidgetState extends State<TransferListWidget> {
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
               child: Text(
-                [
-                  _lastLoad.isEmpty ? 'Ещё не загружали' : 'Загружено ${_time(_lastLoad)}',
-                  if (_catalogCount > 0) 'каталог $_catalogCount',
-                ].join(' · '),
+                _lastLoad.isEmpty ? 'Ещё не загружали' : 'Загружено ${_time(_lastLoad)}',
                 style: const TextStyle(fontSize: 12, color: Colors.black54),
               ),
             ),
@@ -1003,8 +843,6 @@ class _TransferListWidgetState extends State<TransferListWidget> {
                 ]),
               ),
             if (_error != null) _banner(_error!, Colors.red.shade50, Colors.red.shade800, Icons.error_outline),
-            if (_warning != null && _error == null)
-              _banner(_warning!, Colors.orange.shade50, Colors.orange.shade900, Icons.info_outline),
             if (toSend > 0 && !busy)
               Container(
                 margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
