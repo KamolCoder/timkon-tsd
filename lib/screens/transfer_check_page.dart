@@ -219,13 +219,17 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   void initState() {
     super.initState();
     _scanFocus.addListener(() {
-      if (!_scanFocus.hasFocus) _refocus();
+      if (!_scanFocus.hasFocus && !_reattaching) _refocus();
     });
+    // Back from the Android home screen: the field still has focus, but its input
+    // connection is gone and the scanner types into nowhere → reconnect it.
+    _lifecycle = AppLifecycleListener(onResume: _onResume);
     _load();
   }
 
   @override
   void dispose() {
+    _lifecycle.dispose();
     _scanTimer?.cancel();
     _scanSettle.cancel();
     _scanCtrl.dispose();
@@ -237,6 +241,33 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || _dialogOpen || _loading || _error != null) return;
       if (!_scanFocus.hasFocus) _scanFocus.requestFocus();
+    });
+  }
+
+  late final AppLifecycleListener _lifecycle;
+  bool _reattaching = false;
+
+  void _onResume() {
+    if (!_dialogOpen) return _reattach();
+    // a dialog is open: reconnect its focused field (quantity / hidden scan field)
+    final node = FocusManager.instance.primaryFocus;
+    if (node == null) return;
+    node.unfocus();
+    Future.delayed(const Duration(milliseconds: 50), () {
+      if (node.context != null) node.requestFocus();
+    });
+  }
+
+  /// Unfocus + focus again (what the ⌨ button does): opens a fresh input
+  /// connection, so a keyboard-wedge scanner reaches the field again. Used after
+  /// returning to the app and after every dialog.
+  void _reattach() {
+    if (!mounted || _dialogOpen || _loading || _error != null) return;
+    _reattaching = true;
+    _scanFocus.unfocus();
+    Future.delayed(const Duration(milliseconds: 50), () {
+      _reattaching = false;
+      if (mounted && !_dialogOpen) _scanFocus.requestFocus();
     });
   }
 
@@ -462,7 +493,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       ),
     );
     _dialogOpen = false;
-    _refocus();
+    _reattach();
     return r;
   }
 
@@ -526,7 +557,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     );
     _dialogOpen = false;
     settle?.cancel();
-    _refocus();
+    _reattach();
     ctrl.dispose();
     return next;
   }
@@ -639,7 +670,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     );
     _dialogOpen = false;
     settle?.cancel();
-    _refocus();
+    _reattach();
     ctrl.dispose();
     hint.dispose();
     return res;
@@ -711,7 +742,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       ),
     );
     _dialogOpen = false;
-    _refocus();
+    _reattach();
     return res == true;
   }
 
