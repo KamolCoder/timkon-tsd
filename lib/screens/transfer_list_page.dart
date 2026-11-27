@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -795,10 +796,12 @@ class _TransferListWidgetState extends State<TransferListWidget> {
             Container(
               width: double.infinity,
               color: scheme.primaryContainer,
-              padding: const EdgeInsets.fromLTRB(16, 10, 4, 10),
+              padding: const EdgeInsets.fromLTRB(16, 0, 0, 0),
               child: Row(children: [
                 Expanded(
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                     const Text('Перемещения', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
                     Text(
                       [
@@ -808,10 +811,10 @@ class _TransferListWidgetState extends State<TransferListWidget> {
                       style: const TextStyle(fontSize: 13, color: Colors.black54),
                     ),
                   ]),
+                  ),
                 ),
-                if (widget.onSettings != null)
-                  IconButton(
-                      tooltip: 'Настройки', icon: const Icon(Icons.settings), onPressed: busy ? null : _openSettings),
+                // settings: no visible button, hold the top right corner for 2 s
+                if (widget.onSettings != null) _HiddenHold(onHeld: busy ? null : _openSettings),
               ]),
             ),
             // ── main action ──
@@ -971,6 +974,56 @@ class _TransferListWidgetState extends State<TransferListWidget> {
       ),
     );
   }
+}
+
+/// Invisible square: fires after being held for [hold] without moving.
+/// Raw pointer events, so nothing (ripple, tooltip) gives it away.
+class _HiddenHold extends StatefulWidget {
+  const _HiddenHold({required this.onHeld});
+  final Future<void> Function()? onHeld;
+  static const hold = Duration(seconds: 2);
+  static const size = 64.0;
+
+  @override
+  State<_HiddenHold> createState() => _HiddenHoldState();
+}
+
+class _HiddenHoldState extends State<_HiddenHold> {
+  Timer? _timer;
+  Offset _start = Offset.zero;
+
+  void _cancel() {
+    _timer?.cancel();
+    _timer = null;
+  }
+
+  @override
+  void dispose() {
+    _cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Listener(
+        behavior: HitTestBehavior.opaque,
+        onPointerDown: (e) {
+          _cancel();
+          final cb = widget.onHeld;
+          if (cb == null) return;
+          _start = e.position;
+          _timer = Timer(_HiddenHold.hold, () {
+            _timer = null;
+            HapticFeedback.mediumImpact();
+            cb();
+          });
+        },
+        onPointerMove: (e) {
+          if ((e.position - _start).distance > 20) _cancel();
+        },
+        onPointerUp: (_) => _cancel(),
+        onPointerCancel: (_) => _cancel(),
+        child: const SizedBox(width: _HiddenHold.size, height: _HiddenHold.size),
+      );
 }
 
 /// Swipe from the left edge → back (Navigator.maybePop). Works on any Android,
