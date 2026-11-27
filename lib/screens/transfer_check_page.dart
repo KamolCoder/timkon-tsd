@@ -919,7 +919,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
             focusNode: _scanFocus,
             autofocus: true,
             showCursor: true,
-            keyboardType: _keyboard ? TextInputType.text : TextInputType.none,
+            keyboardType: _keyboard ? TextInputType.number : TextInputType.none, // ⌨: digits pad at once
             textInputAction: TextInputAction.done,
             onChanged: _onScanChanged,
             onSubmitted: (_) => _onScanEnter(),
