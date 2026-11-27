@@ -1,20 +1,12 @@
-// Automatic FlutterFlow imports
-import '/flutter_flow/flutter_flow_theme.dart';
-import '/flutter_flow/flutter_flow_util.dart';
-import '/custom_code/widgets/index.dart'; // Imports other custom widgets
-import 'package:flutter/material.dart';
-// Begin custom widget code
-// DO NOT REMOVE OR MODIFY THE CODE ABOVE!
-
 import 'dart:convert';
 
+import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// Settings page of the TSD app, stored on the device (SharedPreferences
 /// `tsd_settings`) and read by TransferListWidget / TransferCheckWidget.
-/// Sections: 1C (address, login, warehouse picked from 1C), Stock API (goods
-/// catalog with photos: address + read-only API key), storekeeper name.
+/// Sections: 1C (address, login, warehouse picked from 1C), storekeeper name.
 class TsdSettingsWidget extends StatefulWidget {
   const TsdSettingsWidget({
     super.key,
@@ -35,23 +27,20 @@ class TsdSettingsWidget extends StatefulWidget {
 
 class _TsdSettingsWidgetState extends State<TsdSettingsWidget> {
   static const _prefsKey = 'tsd_settings';
-  static const _defaultStock = 'https://stock.timkon.uz';
 
   final _url = TextEditingController();
   final _user = TextEditingController();
   final _pass = TextEditingController();
   final _checker = TextEditingController();
-  final _stockUrl = TextEditingController();
-  final _stockKey = TextEditingController();
 
   String _warehouseKey = '';
   String _warehouseName = '';
   List<MapEntry<String, String>> _warehouses = [];
 
-  bool _busy1c = false, _busyStock = false;
-  bool _showPass = false, _showKey = false;
-  String? _status1c, _statusStock;
-  bool _ok1c = false, _okStock = false;
+  bool _busy1c = false;
+  bool _showPass = false;
+  String? _status1c;
+  bool _ok1c = false;
 
   @override
   void initState() {
@@ -61,7 +50,7 @@ class _TsdSettingsWidgetState extends State<TsdSettingsWidget> {
 
   @override
   void dispose() {
-    for (final c in [_url, _user, _pass, _checker, _stockUrl, _stockKey]) {
+    for (final c in [_url, _user, _pass, _checker]) {
       c.dispose();
     }
     super.dispose();
@@ -77,16 +66,12 @@ class _TsdSettingsWidgetState extends State<TsdSettingsWidget> {
       _checker.text = (m['checkerName'] ?? '').toString();
       _warehouseKey = (m['warehouseKey'] ?? '').toString();
       _warehouseName = (m['warehouseName'] ?? '').toString();
-      _stockUrl.text = (m['stockUrl'] ?? '').toString();
-      _stockKey.text = (m['stockKey'] ?? '').toString();
     } catch (_) {}
     if (_url.text.isEmpty) _url.text = 'http://';
-    if (_stockUrl.text.isEmpty) _stockUrl.text = _defaultStock;
     if (mounted) setState(() {});
   }
 
   String get _root => _url.text.trim().replaceAll(RegExp(r'/+$'), '');
-  String get _stockRoot => _stockUrl.text.trim().replaceAll(RegExp(r'/+$'), '');
 
   /// Loads Catalog_Склады — also the connection test of 1C.
   Future<void> _test1c() async {
@@ -123,25 +108,6 @@ class _TsdSettingsWidgetState extends State<TsdSettingsWidget> {
     if (mounted) setState(() => _busy1c = false);
   }
 
-  Future<void> _testStock() async {
-    setState(() {
-      _busyStock = true;
-      _statusStock = null;
-    });
-    try {
-      final resp = await http.get(Uri.parse('$_stockRoot/api/stock/me'),
-          headers: {'X-API-Key': _stockKey.text.trim(), 'Accept': 'application/json'}).timeout(const Duration(seconds: 20));
-      if (resp.statusCode == 401 || resp.statusCode == 403) throw 'Неверный ключ Stock API';
-      if (resp.statusCode != 200) throw 'HTTP ${resp.statusCode}';
-      _statusStock = 'Каталог подключён ✓';
-      _okStock = true;
-    } catch (e) {
-      _statusStock = e is String ? e : 'Нет связи со Stock API (нужен интернет): $e';
-      _okStock = false;
-    }
-    if (mounted) setState(() => _busyStock = false);
-  }
-
   Future<void> _save() async {
     String? problem;
     if (_root.length < 10 || _user.text.trim().isEmpty) problem = 'Заполните адрес и пользователя 1С';
@@ -163,8 +129,6 @@ class _TsdSettingsWidgetState extends State<TsdSettingsWidget> {
           'warehouseKey': _warehouseKey,
           'warehouseName': _warehouseName,
           'checkerName': _checker.text.trim(),
-          'stockUrl': _stockRoot,
-          'stockKey': _stockKey.text.trim(),
         }));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Настройки сохранены ✓')));
@@ -292,22 +256,6 @@ class _TsdSettingsWidgetState extends State<TsdSettingsWidget> {
                       ),
                     ),
                   ),
-                ]),
-                _section('Каталог и фото (Stock API)', Icons.photo_library_outlined, [
-                  const Text('Названия и фото всех товаров — чтобы узнать товар не из накладной. '
-                      'Нужен интернет при загрузке.',
-                      style: TextStyle(color: Colors.black54)),
-                  const SizedBox(height: 10),
-                  _field(_stockUrl, 'Адрес Stock API', type: TextInputType.url, icon: Icons.link),
-                  _field(_stockKey, 'Ключ API (только чтение)',
-                      icon: Icons.key_outlined,
-                      obscure: !_showKey,
-                      suffix: IconButton(
-                        icon: Icon(_showKey ? Icons.visibility_off : Icons.visibility),
-                        onPressed: () => setState(() => _showKey = !_showKey),
-                      )),
-                  _testButton('Проверить каталог', _busyStock, _testStock),
-                  _status(_statusStock, _okStock),
                 ]),
                 _section('Кладовщик', Icons.badge_outlined, [
                   _field(_checker, 'ФИО (пишется в комментарий 1С)', icon: Icons.person),
