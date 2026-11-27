@@ -91,6 +91,52 @@ class _Item {
   double get plan => lines.fold(0, (s, l) => s + l.plan);
 }
 
+/// EAN / UPC check digit for the data digits: from the right, weights 3, 1, 3, …;
+/// check = (10 − sum mod 10) mod 10.
+int _eanCheckDigit(String digits) {
+  var sum = 0;
+  for (var i = 0; i < digits.length; i++) {
+    final d = digits.codeUnitAt(digits.length - 1 - i) - 48;
+    sum += i.isEven ? d * 3 : d;
+  }
+  return (10 - sum % 10) % 10;
+}
+
+/// After Enter, waits until the field has not changed for [quiet], then calls
+/// [onDone]. A keyboard-wedge scanner's Enter can overtake its last characters
+/// (the code was read without the last digit); they get in before the read.
+class _EnterSettle {
+  _EnterSettle(this.ctrl, this.onDone);
+  final TextEditingController ctrl;
+  final void Function() onDone;
+  static const quiet = Duration(milliseconds: 150);
+  Timer? _timer;
+  String _seen = '';
+
+  bool get pending => _timer != null;
+
+  void enter() {
+    _timer?.cancel();
+    _seen = ctrl.text;
+    _timer = Timer(quiet, _check);
+  }
+
+  void _check() {
+    if (ctrl.text != _seen) {
+      _seen = ctrl.text; // still typing: wait for the next quiet period
+      _timer = Timer(quiet, _check);
+      return;
+    }
+    _timer = null;
+    onDone();
+  }
+
+  void cancel() {
+    _timer?.cancel();
+    _timer = null;
+  }
+}
+
 /// Article for matching: trimmed, lower case, without leading zeros («00435» = «435»).
 String _normArticle(String s) => s.trim().toLowerCase().replaceFirst(RegExp(r'^0+'), '');
 
@@ -134,7 +180,6 @@ enum _Filter { all, left, issues }
 // ───────────────────────────── state ─────────────────────────────
 
 class _TransferCheckWidgetState extends State<TransferCheckWidget> {
-  static const _enterSettle = Duration(milliseconds: 80);
 
   bool _loading = true;
   String? _error;
@@ -163,6 +208,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   final TextEditingController _scanCtrl = TextEditingController();
   final FocusNode _scanFocus = FocusNode();
   Timer? _scanTimer;
+  late final _scanSettle = _EnterSettle(_scanCtrl, _submitScan);
   bool _keyboard = false; // soft keyboard for manual input
   String _lastScan = '';
 
@@ -181,6 +227,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   @override
   void dispose() {
     _scanTimer?.cancel();
+    _scanSettle.cancel();
     _scanCtrl.dispose();
     _scanFocus.dispose();
     super.dispose();
@@ -289,24 +336,22 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   void _submitScan() {
     _scanTimer?.cancel();
+    _scanSettle.cancel();
     final code = _scanCtrl.text.trim();
     _scanCtrl.clear();
     if (code.isNotEmpty) _onScan(code);
     _refocus();
   }
 
-  /// Enter from a keyboard-wedge scanner can arrive before the last character
-  /// reaches the field (the code was read without its last digit, and the digit
-  /// stuck to the next scan). Wait a moment so the field has the whole code.
   void _onScanEnter() {
     _scanTimer?.cancel();
-    _scanTimer = Timer(_enterSettle, _submitScan);
+    _scanSettle.enter();
   }
 
   /// Scanners without an Enter suffix: accept the code 300 ms after the last char.
   void _onScanChanged(String v) {
     _scanTimer?.cancel();
-    if (_keyboard) return;
+    if (_keyboard || _scanSettle.pending) return; // after Enter: _EnterSettle submits
     _scanTimer = Timer(const Duration(milliseconds: 300), () {
       if (_scanCtrl.text.trim().length >= 6) _submitScan();
     });
@@ -323,7 +368,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   Future<void> _onScan(String code) async {
     setState(() => _lastScan = code);
     // barcode of this document / of another downloaded document, else article
-    var hit = _barcodes[code] ?? (await _others())[code];
+    var hit = await _byBarcode(code);
     if (hit == null) {
       final byArt = await _findByArticle(code);
       if (byArt == _cancelled) return;
@@ -340,7 +385,9 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
     String? next;
     double qty = step;
-    if (_askQty || it.weight) {
+    final ask = _askQty || it.weight;
+    if (ask) {
+      _Beep.ok(); // recognized
       final r = await _qtyDialog(it, step);
       if (r == null) return;
       qty = r.qty;
@@ -349,10 +396,16 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
     if (qty > 0) {
       it.fact += qty;
-      if (_status(it) == _St.excess) {
+      final st = _status(it);
+      if (st == _St.excess) {
         _alarm('Больше плана: ${it.name}');
       } else {
         HapticFeedback.lightImpact();
+        if (st == _St.ok) {
+          _Beep.done(); // line complete
+        } else if (!ask) {
+          _Beep.ok();
+        }
       }
       setState(() {});
       await _saveProgress();
@@ -361,6 +414,19 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   }
 
   static const _cancelled = Object();
+
+  /// Barcode of this / another downloaded document. A scanner set up without the
+  /// check digit sends 12 (EAN-13) / 7 (EAN-8) / 11 (UPC-A) digits: retry with it.
+  Future<List<String>?> _byBarcode(String code) async {
+    final others = await _others();
+    List<String>? find(String c) => _barcodes[c] ?? others[c];
+    final hit = find(code);
+    if (hit != null) return hit;
+    if (const {7, 11, 12}.contains(code.length) && RegExp(r'^\d+$').hasMatch(code)) {
+      return find('$code${_eanCheckDigit(code)}');
+    }
+    return null;
+  }
 
   /// Typed article (weighed goods usually have no barcode in 1C) → goods of this
   /// document (several: pick one), then goods of the other downloaded documents
@@ -405,9 +471,10 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   Future<String?> _notInDocDialog(String code, String? name) async {
     _dialogOpen = true;
     HapticFeedback.heavyImpact();
-    SystemSound.play(SystemSoundType.alert);
+    _Beep.error();
     final ctrl = TextEditingController();
     var closed = false;
+    _EnterSettle? settle; // created once: the builder can run again
     final next = await showDialog<String>(
       context: context,
       builder: (ctx) {
@@ -416,6 +483,11 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
           closed = true;
           Navigator.pop(ctx, value);
         }
+
+        settle ??= _EnterSettle(ctrl, () {
+          final t = ctrl.text.trim();
+          if (ctx.mounted) close(t.isEmpty ? null : t);
+        });
 
         return AlertDialog(
           backgroundColor: const Color(0xFFFFEBEE),
@@ -443,10 +515,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
                   controller: ctrl,
                   autofocus: true,
                   keyboardType: TextInputType.none,
-                  onSubmitted: (_) => Future.delayed(_enterSettle, () {
-                    final t = ctrl.text.trim();
-                    if (ctx.mounted) close(t.isEmpty ? null : t);
-                  }),
+                  onSubmitted: (_) => settle?.enter(),
                 ),
               ),
             ),
@@ -456,6 +525,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       },
     );
     _dialogOpen = false;
+    settle?.cancel();
     _refocus();
     ctrl.dispose();
     return next;
@@ -488,6 +558,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     }
 
     var closed = false;
+    _EnterSettle? settle; // created once: the builder can run again
     final res = await showDialog<_QtyResult>(
       context: context,
       builder: (ctx) {
@@ -499,9 +570,9 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
         }
 
         // Same late-last-digit race as the scan field (next scan in the dialog).
-        void submitLater() => Future.delayed(_enterSettle, () {
-              if (ctx.mounted) submit();
-            });
+        settle ??= _EnterSettle(ctrl, () {
+          if (ctx.mounted) submit();
+        });
 
         return AlertDialog(
           contentPadding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
@@ -535,7 +606,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
                         labelText: replace ? 'Факт' : (it.weight ? 'Вес, кг' : 'Количество'),
                         border: const OutlineInputBorder(),
                         isDense: true),
-                    onSubmitted: (_) => submitLater(),
+                    onSubmitted: (_) => settle?.enter(),
                   ),
                 ),
                 const SizedBox(width: 8),
@@ -567,6 +638,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       },
     );
     _dialogOpen = false;
+    settle?.cancel();
     _refocus();
     ctrl.dispose();
     hint.dispose();
@@ -595,7 +667,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   void _alarm(String msg) {
     HapticFeedback.heavyImpact();
-    SystemSound.play(SystemSoundType.alert);
+    _Beep.excess();
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
@@ -847,11 +919,24 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
         // ── filter ──
         Padding(
           padding: const EdgeInsets.fromLTRB(10, 4, 10, 4),
-          child: Wrap(spacing: 6, runSpacing: 4, children: [
-            _filterChip(_Filter.all, 'Все ${_items.length}'),
-            _filterChip(_Filter.left, 'Осталось $left'),
-            _filterChip(_Filter.issues, 'Расхождения $issues', danger: issues > 0),
-          ]),
+          child: SizedBox(
+            width: double.infinity,
+            child: SegmentedButton<_Filter>(
+              showSelectedIcon: false,
+              style: const ButtonStyle(
+                visualDensity: VisualDensity.compact,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                padding: WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 4)),
+              ),
+              segments: [
+                _filterSeg(_Filter.all, 'Все ${_items.length}'),
+                _filterSeg(_Filter.left, 'Осталось $left'),
+                _filterSeg(_Filter.issues, 'Расхожд. $issues', danger: issues > 0),
+              ],
+              selected: {_filter},
+              onSelectionChanged: (v) => setState(() => _filter = v.first),
+            ),
+          ),
         ),
         // ── lines ──
         Expanded(
@@ -884,11 +969,16 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
         width: widget.width, height: widget.height, child: _EdgeSwipeBack(child: SafeArea(child: body)));
   }
 
-  Widget _filterChip(_Filter f, String label, {bool danger = false}) => ChoiceChip(
-        label: Text(label, style: TextStyle(color: danger && _filter != f ? Colors.red.shade700 : null)),
-        selected: _filter == f,
-        showCheckmark: false,
-        onSelected: (_) => setState(() => _filter = f),
+  /// One line always: the label shrinks a little instead of wrapping (3-digit counts).
+  ButtonSegment<_Filter> _filterSeg(_Filter f, String label, {bool danger = false}) => ButtonSegment(
+        value: f,
+        label: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Text(label,
+              maxLines: 1,
+              softWrap: false,
+              style: TextStyle(fontSize: 13, color: danger && _filter != f ? Colors.red.shade700 : null)),
+        ),
       );
 
   Widget _row(_Item it) {
@@ -1044,4 +1134,24 @@ class _EdgeSwipeBackState extends State<_EdgeSwipeBack> {
       ),
     ]);
   }
+}
+
+/// Scan sounds: Android ToneGenerator (MainActivity, channel `tsd/beep`), loud and
+/// independent of the «touch sounds» setting. No-op if the channel is missing.
+class _Beep {
+  static const _ch = MethodChannel('tsd/beep');
+
+  static void _play(String kind) => _ch.invokeMethod<void>(kind).catchError((_) {});
+
+  /// recognized / +1
+  static void ok() => _play('ok');
+
+  /// line complete (fact = plan)
+  static void done() => _play('done');
+
+  /// more than the plan
+  static void excess() => _play('excess');
+
+  /// not in the document / not found
+  static void error() => _play('error');
 }
