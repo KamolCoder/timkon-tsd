@@ -1,16 +1,9 @@
-// Automatic FlutterFlow imports
-import '/flutter_flow/flutter_flow_theme.dart';
-import '/flutter_flow/flutter_flow_util.dart';
-import '/custom_code/widgets/index.dart'; // Imports other custom widgets
-import 'package:flutter/material.dart';
-// Begin custom widget code
-// DO NOT REMOVE OR MODIFY THE CODE ABOVE!
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -194,6 +187,8 @@ enum _Filter { all, left, issues }
 // ───────────────────────────── state ─────────────────────────────
 
 class _TransferCheckWidgetState extends State<TransferCheckWidget> {
+  static const _enterSettle = Duration(milliseconds: 80);
+
   bool _loading = true;
   String? _error;
 
@@ -373,6 +368,14 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     _refocus();
   }
 
+  /// Enter from a keyboard-wedge scanner can arrive before the last character
+  /// reaches the field (the code was read without its last digit, and the digit
+  /// stuck to the next scan). Wait a moment so the field has the whole code.
+  void _onScanEnter() {
+    _scanTimer?.cancel();
+    _scanTimer = Timer(_enterSettle, _submitScan);
+  }
+
   /// Scanners without an Enter suffix: accept the code 300 ms after the last char.
   void _onScanChanged(String v) {
     _scanTimer?.cancel();
@@ -482,13 +485,21 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       ctrl.selection = TextSelection.collapsed(offset: ctrl.text.length);
     }
 
+    var closed = false;
     final res = await showDialog<_QtyResult>(
       context: context,
       builder: (ctx) {
         void submit() {
           final r = parse(ctrl.text);
-          if (r != null) Navigator.pop(ctx, r);
+          if (r == null || closed) return;
+          closed = true; // Enter + button / delayed Enter must not pop twice
+          Navigator.pop(ctx, r);
         }
+
+        // Same late-last-digit race as the scan field (next scan in the dialog).
+        void submitLater() => Future.delayed(_enterSettle, () {
+              if (ctx.mounted) submit();
+            });
 
         final art = (it?.article.isNotEmpty ?? false) ? it!.article : (article ?? '').toString();
         return AlertDialog(
@@ -536,7 +547,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
                     style: const TextStyle(fontSize: 30, fontWeight: FontWeight.bold),
                     decoration: const InputDecoration(
                         labelText: 'Количество', border: OutlineInputBorder(), isDense: true),
-                    onSubmitted: (_) => submit(),
+                    onSubmitted: (_) => submitLater(),
                   ),
                 ),
                 const SizedBox(width: 8),
@@ -548,7 +559,13 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
             ]),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Отмена')),
+            TextButton(
+                onPressed: () {
+                  if (closed) return;
+                  closed = true;
+                  Navigator.pop(ctx);
+                },
+                child: const Text('Отмена')),
             FilledButton(onPressed: submit, child: const Text('Добавить')),
           ],
         );
@@ -815,7 +832,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
             keyboardType: _keyboard ? TextInputType.text : TextInputType.none,
             textInputAction: TextInputAction.done,
             onChanged: _onScanChanged,
-            onSubmitted: (_) => _submitScan(),
+            onSubmitted: (_) => _onScanEnter(),
             onEditingComplete: () {},
             style: const TextStyle(fontSize: 18),
             decoration: InputDecoration(

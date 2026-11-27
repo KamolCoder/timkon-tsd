@@ -1,0 +1,32 @@
+name: timkon_tsd
+description: "TSD: check of warehouse → store transfers against 1C."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cached_network_image: ^3.4.1
+  http: ^1.2.2
+  path: ^1.9.0
+  shared_preferences: ^2.3.2
+  sqflite: ^2.4.1
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter:
+  uses-material-design: true
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: assets/icon/launcher_icon_1024.png
+  adaptive_icon_background: "#11796F"
+  adaptive_icon_foreground: assets/icon/adaptive_foreground_1024.png
+  min_sdk_android: 21
