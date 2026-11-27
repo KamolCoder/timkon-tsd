@@ -92,6 +92,18 @@ class _Catalog {
     return r.isEmpty ? null : Map<String, dynamic>.from(r.first);
   }
 
+  /// article (as typed: «435», «00435») → products, at most [limit]
+  static Future<List<Map<String, dynamic>>> byArticle(String code, {int limit = 20}) async {
+    final db = await open();
+    if (db == null) return const [];
+    final n = _normArticle(code);
+    if (n.isEmpty) return const [];
+    // LTRIM(…, '0') so «00435» in the catalog matches «435» typed on the TSD
+    final r = await db.rawQuery(
+        "SELECT * FROM products WHERE LOWER(LTRIM(TRIM(article), '0')) = ? LIMIT ?", [n, limit]);
+    return [for (final x in r) Map<String, dynamic>.from(x)];
+  }
+
   static Future<Map<String, Map<String, dynamic>>> byIds(Iterable<String> ids) async {
     final db = await open();
     final out = <String, Map<String, dynamic>>{};
@@ -142,6 +154,9 @@ class _Item {
   String get key => '$productKey|$charKey';
   double get plan => lines.fold(0, (s, l) => s + l.plan);
 }
+
+/// Article for matching: trimmed, lower case, without leading zeros («00435» = «435»).
+String _normArticle(String s) => s.trim().toLowerCase().replaceFirst(RegExp(r'^0+'), '');
 
 double _num(dynamic v) => v is num ? v.toDouble() : double.tryParse('$v') ?? 0;
 
@@ -202,6 +217,10 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
   /// barcodes / names of goods of the other downloaded documents
   Map<String, List<String>>? _otherCodes;
   final Map<String, String> _otherNames = {};
+
+  /// normalized article → productKeys, and weighed goods, of the other downloaded documents
+  final Map<String, List<String>> _otherArticles = {};
+  final Set<String> _otherWeight = {};
 
   final Map<String, double> _unitCoef = {};
   String _stockBase = '';
@@ -319,6 +338,9 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       if (e == null) continue;
       final pk = k.substring(_Store.prodPrefix.length);
       _otherNames[pk] = (e['name'] ?? '').toString();
+      final art = _normArticle((e['article'] ?? '').toString());
+      if (art.isNotEmpty) _otherArticles.putIfAbsent(art, () => []).add(pk);
+      if (e['weight'] == true) _otherWeight.add(pk);
       for (final u in (e['units'] as List? ?? const [])) {
         _unitCoef.putIfAbsent(u[0].toString(), () => math.max(1.0, _num(u[1])));
       }
@@ -395,8 +417,18 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
   Future<void> _onScan(String code) async {
     setState(() => _lastScan = code);
-    final hit = _barcodes[code] ?? (await _others())[code];
-    final cat = hit == null || !_byKey.containsKey('${hit[0]}|${hit[1]}') ? await _Catalog.byBarcode(code) : null;
+    var hit = _barcodes[code] ?? (await _others())[code];
+    Map<String, dynamic>? cat;
+    if (hit == null) {
+      // not a barcode → article (weighed goods usually have no barcode in 1C)
+      final byArt = await _findByArticle(code);
+      if (byArt == _cancelled) return;
+      if (byArt is List<String>) hit = byArt;
+      if (byArt is Map<String, dynamic>) cat = byArt;
+    }
+    if (cat == null && (hit == null || !_byKey.containsKey('${hit[0]}|${hit[1]}'))) {
+      cat = await _Catalog.byBarcode(code);
+    }
 
     String key, productKey, charKey, name;
     String thumb = '', image = '';
@@ -417,7 +449,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       productKey = '?';
       charKey = code;
       key = '?|$code';
-      name = 'Неизвестный штрихкод $code';
+      name = 'Не найден штрихкод / артикул $code';
     }
     final existing = _byKey[key] ?? _byKey['$productKey|$_zeroGuid'];
     if (existing != null) {
@@ -428,11 +460,13 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       image = (cat['image'] ?? '').toString();
     }
     final inDoc = existing?.inDoc ?? false;
+    final weight = existing?.weight ?? _otherWeight.contains(productKey);
 
     String? next;
     double qty = step;
-    if (_askQty) {
-      final r = await _qtyDialog(existing, name, inDoc, step, image.isNotEmpty ? image : thumb, cat?['article']);
+    if (_askQty || weight) {
+      final r = await _qtyDialog(existing, name, inDoc, step, image.isNotEmpty ? image : thumb, cat?['article'],
+          weight: weight);
       if (r == null) return;
       qty = r.qty;
       next = r.nextCode;
@@ -442,6 +476,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
       var it = existing;
       if (it == null) {
         it = _Item(productKey, charKey, name, inDoc: false)
+          ..weight = weight
           ..thumb = thumb
           ..image = image
           ..article = (cat?['article'] ?? '').toString();
@@ -461,9 +496,53 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     if (next != null) await _onScan(next);
   }
 
+  static const _cancelled = Object();
+
+  /// Typed article → goods of this document (several: pick one), then goods of the
+  /// other downloaded documents, then the catalog. Returns a barcode-like hit
+  /// [productKey, charKey, unitKey], a catalog row, null (nothing) or [_cancelled].
+  Future<Object?> _findByArticle(String code) async {
+    final n = _normArticle(code);
+    if (n.isEmpty) return null;
+    final inDoc = _items.where((i) => i.inDoc && _normArticle(i.article) == n).toList();
+    if (inDoc.isNotEmpty) {
+      final it = inDoc.length == 1 ? inDoc.first : await _pickItem(inDoc, code);
+      if (it == null) return _cancelled;
+      return [it.productKey, it.charKey, ''];
+    }
+    await _others();
+    final other = _otherArticles[n];
+    if (other != null && other.isNotEmpty) return [other.first, _zeroGuid, ''];
+    final cat = await _Catalog.byArticle(code);
+    return cat.isEmpty ? null : cat.first;
+  }
+
+  Future<_Item?> _pickItem(List<_Item> items, String code) async {
+    _dialogOpen = true;
+    final r = await showDialog<_Item>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: Text('Артикул $code'),
+        children: [
+          for (final it in items)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, it),
+              child: Text('${it.name}\nплан ${_fmt(it.plan)} · собрано ${_fmt(it.fact)}'),
+            ),
+        ],
+      ),
+    );
+    _dialogOpen = false;
+    _refocus();
+    return r;
+  }
+
   Future<_QtyResult?> _qtyDialog(
-      _Item? it, String name, bool inDoc, double step, String photo, dynamic article) async {
-    final ctrl = TextEditingController(text: _fmt(step));
+      _Item? it, String name, bool inDoc, double step, String photo, dynamic article,
+      {bool weight = false}) async {
+    // weighed goods: no default, the weight must be typed
+    final ctrl = TextEditingController(text: weight ? '' : _fmt(step));
+    final hint = ValueNotifier<String?>(null);
     ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
     _dialogOpen = true;
     if (!inDoc) {
@@ -473,7 +552,12 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
 
     _QtyResult? parse(String raw) {
       final t = raw.trim();
-      if (t.length >= 8 && RegExp(r'^\d+$').hasMatch(t)) return _QtyResult(step, t); // next barcode
+      if (t.length >= 8 && RegExp(r'^\d+$').hasMatch(t)) {
+        if (!weight) return _QtyResult(step, t); // next barcode
+        ctrl.clear();
+        hint.value = 'Сначала введите вес';
+        return null;
+      }
       final v = double.tryParse(t.replaceAll(',', '.'));
       if (v == null || v < 0 || v > 99999) return null;
       return _QtyResult(v, null);
@@ -545,8 +629,10 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
                     textAlign: TextAlign.center,
                     keyboardType: const TextInputType.numberWithOptions(decimal: true),
                     style: const TextStyle(fontSize: 30, fontWeight: FontWeight.bold),
-                    decoration: const InputDecoration(
-                        labelText: 'Количество', border: OutlineInputBorder(), isDense: true),
+                    decoration: InputDecoration(
+                        labelText: weight ? 'Вес, кг' : 'Количество',
+                        border: const OutlineInputBorder(),
+                        isDense: true),
                     onSubmitted: (_) => submitLater(),
                   ),
                 ),
@@ -554,8 +640,15 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
                 _roundBtn(Icons.add, () => bump(1)),
               ]),
               const SizedBox(height: 4),
-              const Text('Enter — добавить. Следующий скан добавит этот товар сам.',
-                  style: TextStyle(fontSize: 12, color: Colors.black45)),
+              ValueListenableBuilder<String?>(
+                valueListenable: hint,
+                builder: (_, h, _) => Text(
+                    h ??
+                        (weight
+                            ? 'Весовой товар: введите вес, Enter — добавить.'
+                            : 'Enter — добавить. Следующий скан добавит этот товар сам.'),
+                    style: TextStyle(fontSize: 12, color: h != null ? Colors.red.shade700 : Colors.black45)),
+              ),
             ]),
           ),
           actions: [
@@ -574,6 +667,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
     _dialogOpen = false;
     _refocus();
     ctrl.dispose();
+    hint.dispose();
     return res;
   }
 
@@ -838,7 +932,7 @@ class _TransferCheckWidgetState extends State<TransferCheckWidget> {
             decoration: InputDecoration(
               filled: true,
               fillColor: const Color(0xFFF1F3F4),
-              hintText: _lastScan.isEmpty ? 'Сканируйте товар' : 'Последний: $_lastScan',
+              hintText: _lastScan.isEmpty ? 'Скан или артикул (⌨)' : 'Последний: $_lastScan',
               prefixIcon: const Icon(Icons.qr_code_scanner, size: 28),
               border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
               suffixIcon: IconButton(
